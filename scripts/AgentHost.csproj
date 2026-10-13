@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    虚拟窗口宿主。2026-09 从 .NET Framework 4 的 csc 单文件编译迁到 .NET 10。
+    依赖框架发布（本机装 Desktop Runtime 10），单文件：scripts\build.ps1 发布后
+    只把一个 AgentHost.exe 拷回 scripts\，调用方（Start-Host.cmd、外部程序）路径不变。
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>AgentHost</AssemblyName>
+    <RootNamespace>AgentHost</RootNamespace>
+    <!-- Linux / CI 上也能 dotnet build 做编译检查（跑不了，只查编译）。 -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+
+    <!-- 源码是 C# 5 时代写的：不开隐式 using（System.Threading.Timer 会跟 WinForms 的 Timer 撞名），不开可空注解。 -->
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+
+    <ApplicationManifest>AgentHost.manifest</ApplicationManifest>
+    <ApplicationIcon>AgentHost.ico</ApplicationIcon>
+    <!--
+      WFO0003 建议把 DPI 设置从 manifest 挪到 Application.SetHighDpiMode。这里反过来：
+      DPI 只由 manifest 定（PerMonitorV2，跟 Framework 版一模一样，进程起来之前系统就设好），
+      代码里不再调 SetHighDpiMode / SetProcessDpiAwareness，所以不存在两处打架。见 Program.Main。
+    -->
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
+
+    <!--
+      固定 x64：Native.GetClassLongPtr 只在 64 位 user32 里有导出，AnyCPU 若被跑成 32 位会直接找不到入口。
+      以前 Framework 版是 AnyCPU、在 64 位系统上实际就是 64 位进程，这里只是把它写死。
+    -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PlatformTarget>x64</PlatformTarget>
+    <SelfContained>false</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <!-- pdb 嵌进程序集：发布出来只有一个 exe，异常堆栈照样有行号。 -->
+    <DebugType>embedded</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 只编 src\ 下宿主自己的源码；make-icon.cs 是另一个带 Main 的小工具，不编进来。 -->
+    <Compile Remove="**/*.cs" />
+    <Compile Include="src/**/*.cs" />
+    <!-- 钩子小程序嵌进 exe，装钩子时释放到 LOCALAPPDATA 下的 AgentHost/bin（见 HookSetup） -->
+    <EmbeddedResource Include="hooks/agenthost-hook.cjs" LogicalName="agenthost-hook.cjs" />
+    <EmbeddedResource Include="hooks/agenthost-opencode.js" LogicalName="agenthost-opencode.js" />
+  </ItemGroup>
+
+</Project>
