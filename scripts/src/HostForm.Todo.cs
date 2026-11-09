@@ -89,24 +89,54 @@ internal static class TodoList
         }
     }
 
+    // 长期项目小标按家配色（用户 11-09：「不同的agent对应的长期项目给一个不同的颜色吧，目前Claude这个颜色就挺好」
+    // 「字体看上去太细了」「比较模糊」）：Claude 陶土橙、Codex 绿、Antigravity 蓝、DeepSeek 靛、OpenCode 灰；
+    // 字用加粗、比底色深一档，淡底只当衬；可能做完了的长期项目也不变灰
+    public static Color ProjectInk(string kind)
+    {
+        bool l = Theme.Light;
+        switch (kind)
+        {
+            case "claude": return l ? Color.FromArgb(178, 82, 50) : Color.FromArgb(236, 150, 118);
+            case "codex": return l ? Color.FromArgb(14, 122, 84) : Color.FromArgb(110, 215, 165);
+            case "antigravity": return l ? Color.FromArgb(11, 87, 208) : Color.FromArgb(150, 188, 250);
+            case "dsh": return l ? Color.FromArgb(62, 84, 214) : Color.FromArgb(150, 165, 255);
+            case "opencode": return l ? Color.FromArgb(70, 74, 80) : Color.FromArgb(205, 208, 212);
+            default: return Theme.Brand;
+        }
+    }
+    public static Color ProjectBack(string kind) { return Color.FromArgb(Theme.Light ? 34 : 52, ProjectInk(kind)); }
+
     public static string GroupName(int g)
     {
         return g == 1 ? L.T("等你的") : g == 2 ? L.T("agent 在做") : g == 3 ? L.T("等别人或外部") : g == 4 ? L.T("长期搁置") : L.T("可能做完了");
     }
 
-    // 条带上放的：只放「等你的」和急的，搁置的、可能做完了的不放，最多 5 个（草案：「条带只放『等你』+ 急的，最多 5 个，其余在面板里」）
+    // 条带上放的：一次性的只放「等你的」和急的，最多 5 个（草案：「条带只放『等你』+ 急的，最多 5 个，其余在面板里」）；
+    // 长期项目（没搁置的）不管卡在谁，每个项目常驻一个胶囊（带项目名小标），跟一次性的一起按四象限排，满 5 个时只砍一次性的。
+    // 用户 11-09：「我不是说了长期任务要显示出来吗」—— 11-09 分档那一版按「卡在谁」筛，把 agent 在做的长期项目筛掉了。
+    // 搁置的、可能做完了的照旧不放（搁置的在面板「长期搁置」里）
     public const int StripMax = 5;
     public static List<Item> ForStrip()
     {
-        var l = Items.FindAll(x => x.State == "open" && !x.Shelved && (x.Group == 1 || x.Urgent));
-        l.Sort(delegate(Item a, Item b)
+        Comparison<Item> cmp = delegate(Item a, Item b)
         {
             int c = a.Quad.CompareTo(b.Quad);
             if (c != 0) return c;
             c = (a.Due > 0 ? a.Due : long.MaxValue).CompareTo(b.Due > 0 ? b.Due : long.MaxValue);
             return c != 0 ? c : b.Updated.CompareTo(a.Updated);
-        });
-        if (l.Count > StripMax) l.RemoveRange(StripMax, l.Count - StripMax);
+        };
+        var l = Items.FindAll(x => x.State == "open" && !x.Shelved && !x.LongTerm && (x.Group == 1 || x.Urgent));
+        // 长期项目做不完，扫描判的「可能做完了」（maybe）不算数，照样上条；只有勾掉（done）才下去。
+        // 用户 11-09：「…不也是长期项目吗」—— 长期项目被判成 maybe 掉了
+        var lt = Items.FindAll(x => (x.State == "open" || x.State == "maybe") && !x.Shelved && x.LongTerm);
+        lt.Sort(delegate(Item a, Item b) { int c = a.Group.CompareTo(b.Group); return c != 0 ? c : cmp(a, b); });
+        var seen = new HashSet<string>();
+        foreach (Item x in lt) if (seen.Add(x.Project)) l.Add(x);
+        l.Sort(cmp);   // 跟一次性的一起按四象限排（重要的长期项目照旧排在不急不重要的前面）
+        // 超过 5 个时只砍一次性的，长期项目一个不砍
+        for (int i = l.Count - 1, extra = l.Count - StripMax; i >= 0 && extra > 0; i--)
+            if (!l[i].LongTerm) { l.RemoveAt(i); extra--; }
         return l;
     }
 
@@ -866,13 +896,16 @@ internal sealed partial class HostForm
             if (x.LongTerm)
             {
                 // 项目名的小标在标题前面
-                int pw = TextRenderer.MeasureText(x.Project, small).Width + D(12);
-                var pr = new Rectangle(tx, top + D(3), pw, D(20));
-                using (GraphicsPath gp = Theme.Round(pr, D(6)))
-                using (var br = new SolidBrush(Color.FromArgb(Theme.Light ? 22 : 40, Theme.Brand)))
-                    g.FillPath(br, gp);
-                Theme.Text(g, x.Project, small, maybe ? Theme.Dim : Theme.Brand, pr, StringAlignment.Center);
-                tx = pr.Right + D(8);
+                using (var tagF = Fonts.Medium(small.Size))
+                {
+                    int pw = TextRenderer.MeasureText(x.Project, tagF).Width + D(12);
+                    var pr = new Rectangle(tx, top + D(3), pw, D(20));
+                    using (GraphicsPath gp = Theme.Round(pr, D(6)))
+                    using (var br = new SolidBrush(TodoList.ProjectBack(x.Kind)))
+                        g.FillPath(br, gp);
+                    Theme.Text(g, x.Project, tagF, TodoList.ProjectInk(x.Kind), pr, StringAlignment.Center);
+                    tx = pr.Right + D(8);
+                }
             }
             string title = string.IsNullOrEmpty(x.Title) ? (string.IsNullOrEmpty(x.Cwd) ? x.Kind : Path.GetFileName(x.Cwd)) : x.Title;
             Theme.Text(g, title, bold, maybe ? Theme.Dim : Theme.Ink, new RectangleF(tx, top, Math.Max(0, right - tx), D(26)), StringAlignment.Near);
@@ -1022,8 +1055,10 @@ internal sealed partial class HostForm
         int D(int v) { return _host.D(v); }
         Font TitleFont { get { return _title ?? (_title = Fonts.Medium(Font.Size)); } }
         Font SmallFont { get { return _small ?? (_small = Fonts.Regular(Font.Size * 0.9f)); } }
+        Font TagFont { get { return _tagF ?? (_tagF = Fonts.Medium(Font.Size * 0.9f)); } }
+        Font _tagF;
         protected override void OnPaintBackground(PaintEventArgs e) { Theme.PaintUnder(this, e); }
-        protected override void OnFontChanged(EventArgs e) { base.OnFontChanged(e); _title = null; _small = null; }
+        protected override void OnFontChanged(EventArgs e) { base.OnFontChanged(e); _title = null; _small = null; _tagF = null; }
 
         static string Cut(Graphics g, string s, Font f, int w)
         {
@@ -1065,8 +1100,8 @@ internal sealed partial class HostForm
                     string title = Cut(g, TodoList.ShortTitle(it), TitleFont, D(220));
                     int tw = (int)Math.Ceiling(g.MeasureString(title, TitleFont).Width);
                     // 长期项目：标题前一个项目名的小标（最多占 120）
-                    string tag = it.LongTerm ? Cut(g, it.Project, SmallFont, D(120)) : null;
-                    int tagW = tag != null ? (int)Math.Ceiling(g.MeasureString(tag, SmallFont).Width) + D(12) + D(6) : 0;
+                    string tag = it.LongTerm ? Cut(g, it.Project, TagFont, D(120)) : null;
+                    int tagW = tag != null ? (int)Math.Ceiling(g.MeasureString(tag, TagFont).Width) + D(12) + D(6) : 0;
                     // 有时间点的，剩下的事前面先写时间点（急不急就是按它算的）
                     string due = TodoList.DueLabel(it);
                     int cut = due.IndexOf('（');           // 条带上地方小：「（已过 18 小时）」留给提示和面板
@@ -1166,7 +1201,7 @@ internal sealed partial class HostForm
             int pad = D(8), ic = D(18);
             foreach (Chip c in Chips)
             {
-                bool maybe = c.X.State == "maybe";
+                bool maybe = c.X.State == "maybe" && !c.X.LongTerm;   // 长期项目判成可能做完了也不变灰（用户 11-09「比较模糊」）
                 bool hot = c == _hot;
                 using (GraphicsPath gp = Theme.Round(c.R, D(8)))
                 using (var br = new SolidBrush(hot && !_hotCheck ? ShellStyles.Hover : Theme.ChipBg))
@@ -1178,9 +1213,9 @@ internal sealed partial class HostForm
                 if (c.TagR.Width > 0 && _tagText.TryGetValue(c, out tag))
                 {
                     using (GraphicsPath gp = Theme.Round(c.TagR, D(6)))
-                    using (var br = new SolidBrush(Color.FromArgb(Theme.Light ? 22 : 40, Theme.Brand)))
+                    using (var br = new SolidBrush(TodoList.ProjectBack(c.X.Kind)))
                         g.FillPath(br, gp);
-                    Theme.Text(g, tag, SmallFont, maybe ? Theme.Dim : Theme.Brand, c.TagR, StringAlignment.Center);
+                    Theme.Text(g, tag, TagFont, TodoList.ProjectInk(c.X.Kind), c.TagR, StringAlignment.Center);
                     x = c.TagR.Right + D(6);
                 }
                 int tw = (int)Math.Ceiling(g.MeasureString(c.Title, TitleFont).Width);
