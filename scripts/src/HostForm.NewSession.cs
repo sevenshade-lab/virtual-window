@@ -37,8 +37,7 @@ internal sealed partial class HostForm
             p.Action = null;
             Log.W("new-session panel closed, action=" + (act != null));
             if (act != null) BeginInvoke(act);
-            else if (giveBack != IntPtr.Zero && Native.IsWindow(giveBack) && SlotWithHwnd(giveBack) != null)
-                BeginInvoke((MethodInvoker)delegate { if (!_menuOpen) GiveFocus(giveBack, true); });
+            else GiveBackAfterPopup(giveBack);
         };
         Point at = _launch.PointToScreen(new Point(0, _launch.Height + D(6)));
         p.Location = at;
@@ -129,7 +128,7 @@ internal sealed partial class HostForm
         Prefs.SetStr("cli.recent", string.Join("|", list));
     }
 
-    internal sealed class NewSessionPanel : Form
+    internal sealed class NewSessionPanel : Form, IHostPopup
     {
         readonly HostForm _host;
         readonly List<AgentKind> _kinds;
@@ -183,6 +182,7 @@ internal sealed partial class HostForm
             base.OnDeactivate(e);
             if (!_picking && !_closing && !IsDisposed) Close();
         }
+        public void DismissForSlotClick() { if (!_picking && !_closing && !IsDisposed) Close(); }   // 点进了某一格（HostForm.Popups.cs）
 
         protected override void OnKeyDown(KeyEventArgs e)
         {

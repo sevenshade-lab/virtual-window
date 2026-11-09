@@ -163,7 +163,8 @@ internal sealed partial class HostForm
             {
                 int fx = Native.GetSystemMetrics(32 /* SM_CXSIZEFRAME */) + Native.GetSystemMetrics(92);
                 int fy = FrameY();
-                Native.RECT w = mi.rcWork, r = mi.rcMonitor;
+                // 放大 = 全屏时范围是整块屏幕（HostForm.Fullscreen.cs）
+                Native.RECT w = _full ? mi.rcMonitor : mi.rcWork, r = mi.rcMonitor;
                 Marshal.WriteInt32(m.LParam, 8, w.Width + fx * 2);
                 Marshal.WriteInt32(m.LParam, 12, w.Height + fy * 2);
                 Marshal.WriteInt32(m.LParam, 16, w.Left - r.Left - fx);
@@ -191,8 +192,11 @@ internal sealed partial class HostForm
             {
                 int lp = unchecked((int)(long)m.LParam);
                 Point pt = PointToClient(new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF)));
-                if (WindowState != FormWindowState.Maximized && pt.Y < FrameY())
+                if (_full) { }   // 全屏时上沿不拖窗口、不改大小：一拖就从最大化掉下来
+                else if (WindowState != FormWindowState.Maximized && pt.Y < FrameY())
                     m.Result = (IntPtr)12; // HTTOP
+                else if (ToastClickable(pt))
+                    m.Result = (IntPtr)1;  // HTCLIENT：点得动的那句提示（委托），不当标题栏拖
                 else if (pt.Y < ToolbarH + D(6))
                     m.Result = (IntPtr)2;  // HTCAPTION
             }
@@ -207,6 +211,9 @@ internal sealed partial class HostForm
             if (ev == Native.WM_LBUTTONDOWN || ev == Native.WM_RBUTTONDOWN || ev == Native.WM_MBUTTONDOWN)
             {
                 Log.W("PARENTNOTIFY 按下 ev=" + ev.ToString("X"));
+                // 顶栏弹着菜单 / 面板时点进某一格：先把它们关掉（HostForm.Popups.cs 说为什么它们自己关不掉）
+                Slot under = SlotUnderCursor();
+                if (under != null) DismissPopupsForSlotClick(under);
                 if (ev == Native.WM_LBUTTONDOWN && CaptionButtonClick()) return;
                 FocusUnderCursor();
             }

@@ -36,7 +36,13 @@ internal sealed partial class HostForm
         // （设计评审提过把语言和明暗这两个按钮收进设置；2026-10-12 做成试用开关给用户试，他没开，定下来不收。）
         if (_langBtn != null) _langBtn.Bounds = new Rectangle(_minBtn.Left - D(10) - bw, by, bw, bh);
         int right = (_langBtn != null ? _langBtn.Left : _minBtn.Left) - D(24);
-        GlassButton[] row = new GlassButton[] { _claim, _arrange, _cycle, _view, _launch, _settings, _themeBtn };
+        // 「＋ 新会话」不再放：用户 2026-10-27 说跟「Agent 列表」重复（列表里每家都有启动 / 新建 CLI）
+        // 队列视图里不放「跳过」（显示成「下一个」）：用户 2026-10-24 说没啥用；Ctrl+Alt+0 照样能跳
+        var rowList = new List<GlassButton> { _claim, _arrange, _view, _roster, _todo, _settings, _themeBtn };
+        _launch.Visible = false;
+        if (!_queueMode) rowList.Insert(2, _cycle);
+        if (!_full) _cycle.Visible = !_queueMode;
+        GlassButton[] row = rowList.ToArray();
         // 字和按钮占的那一块只包住内容，不拉到右上角几个键跟前。
         // need = 左边距 + 状态那一行 + 分隔 + 每个按钮（文字 + 内边距 + 间隔）。
         _titleW = TitleBlockWidth();
@@ -80,6 +86,18 @@ internal sealed partial class HostForm
             b.Bounds = new Rectangle(x, y, TextW(L.T(b.Text), b.Font) + D(32), h);
             x = b.Right + D(8);
         }
+        // 订阅额度那一条：按钮后面空开一段，到语言按钮前为止；放不下就只画放得下的几家（QuotaStrip 自己截）
+        if (_quota != null)
+        {
+            int qx = x + D(16), qw = Math.Min(_quota.Want(), right - qx);
+            // 比按钮那一排高一点（环 + 下面一行「5h / 周」），占满「字和按钮那一块」的高度
+            _quota.Bounds = new Rectangle(qx, _pill.Y, Math.Max(0, qw), _pill.Height);
+            if (!_full) _quota.Visible = qw > D(80);
+        }
+        // 放大 = 全屏：工具条收起，格子从最上面排起（按钮在 SetToolbarShown 里藏）
+        if (_full) { _toolbarH = 0; _pill = Rectangle.Empty; }
+        // 待办条带：工具条底下一行，有待办才占地方（HostForm.Todo.cs）
+        LayoutTodoStrip();
     }
 
     // 量一次就记住。LayoutToolbar 一趟要量 6 个按钮 + 标题 + 副标题，
@@ -128,11 +146,16 @@ internal sealed partial class HostForm
     // 也不弹模态框（弹框会把焦点从格子里抢走）。
     string _toast;
     DateTime _toastUntil;
+    // 这句提示点了做什么（委托：打开签字的那一页）。没有就是一句普通的话，点了照旧是拖窗口（HostForm.Tasks.cs）
+    MethodInvoker _toastAction;
 
-    void Toast(string msg)
+    void Toast(string msg) { ToastAct(msg, null, 5); }
+
+    void ToastAct(string msg, MethodInvoker action, int seconds)
     {
         _toast = msg;
-        _toastUntil = DateTime.Now.AddSeconds(5);
+        _toastAction = action;
+        _toastUntil = DateTime.Now.AddSeconds(seconds);
         Invalidate(_pill);
     }
 
@@ -227,33 +250,6 @@ internal sealed partial class HostForm
         int nameX = NameX(s);
         s.TitleLbl.Location = new Point(nameX, mid - s.TitleLbl.Height / 2);
         s.StateLbl.Location = new Point(s.TitleLbl.Right + D(8), mid - s.StateLbl.Height / 2);
-        // 表头可以被 config.json 调矮，胶囊不能顶满它，上下各留一点
-        int chipH = Math.Min(D(30), HeaderH - D(8));
-        // 右边两个方的图标按钮，挨着；是干什么的写在悬停提示里
-        // （2026-10-12 之前是写着「放大」「移出」的两个宽按钮，同一次定下来的）
-        int chipW = chipH;
-        int chipGap = D(4);
-        int top = mid - chipH / 2;
-        int x = s.Pane.Right - D(12);
-        s.DropBtn.Bounds = new Rectangle(x - chipW, top, chipW, chipH);
-        // 「移出」是把窗口还成独立窗口，不是关掉它：用「另开窗口」那个图标，不用叉
-        SetChip(s.DropBtn, "移出", "");
-        // 格子窄到表头放不下时，先藏「放大」再藏「移出」，别压到名字上（双击表头照样能放大）。
-        int nameEnd = s.StateLbl.Right + D(8);
-        if (s.ZoomBtn != null)
-        {
-            // 网格和队列同一个按钮：队列里只有中间那张有。
-            // 该不该显示先在这儿算好再设，不回头读 Visible：窗体没显示时读回来一律是 false（它连父窗口一起算），
-            // 离屏测试里这个按钮就一直没摆上位置。
-            bool zoomShown = _slots.Count > 1 && (!_queueMode || s == QueueFront);
-            bool zoomedHere = _queueMode ? (_queueZoom && s == QueueFront) : _solo == s;
-            SetChip(s.ZoomBtn, zoomedHere ? "还原" : "放大", zoomedHere ? "" : "");
-            var zr = new Rectangle(s.DropBtn.Left - chipGap - chipW, top, chipW, chipH);
-            if (zoomShown && zr.Left < nameEnd) zoomShown = false;
-            if (zoomShown) s.ZoomBtn.Bounds = zr;
-            s.ZoomBtn.Visible = zoomShown;
-        }
-        s.DropBtn.Visible = s.DropBtn.Left >= nameEnd;
         s.Site.Bounds = s.Content;
         bool live = s.Hwnd != IntPtr.Zero && Native.IsWindow(s.Hwnd);
         s.LaunchBtn.Visible = !live;
@@ -261,6 +257,42 @@ internal sealed partial class HostForm
             Math.Max(8, (s.Site.ClientSize.Width - s.LaunchBtn.Width) / 2),
             Math.Max(8, (s.Site.ClientSize.Height - s.LaunchBtn.Height) / 2));
         SyncStateLabel(s);
+        PlaceChips(s);
+    }
+
+    // 表头的「放大」「移出」两个按钮。跟着灯（状态那一块）的右边走：状态的字会变宽变窄
+    // （启动中写字、嵌好了只剩一个点），所以排完状态再摆，状态那块宽度一变也重摆（AddSlot 里接了 SizeChanged）。
+    void PlaceChips(Slot s)
+    {
+        if (s.DropBtn == null || s.Pane.Width <= 0) return;
+        // 两个方的图标按钮，挨着；是干什么的写在悬停提示里
+        // （2026-10-12 之前是写着「放大」「移出」的两个宽按钮，同一次定下来的）。
+        // 紧跟在名字和灯后面，不放表头最右边：最右边正下方就是嵌进来那家自己的 ⋮ / ✕，
+        // 上下只隔一条线，想点它的 ✕ 常点成「移出」（用户 2026-10-15）。
+        int chipH = Math.Min(D(30), HeaderH - D(8));
+        int chipW = chipH;
+        int chipGap = D(4);
+        int top = s.Pane.Y + HeaderH / 2 - chipH / 2;
+        // 「移出」是把窗口还成独立窗口，不是关掉它：用「另开窗口」那个图标，不用叉
+        SetChip(s.DropBtn, "移出", "");
+        int x = s.StateLbl.Right + D(10);
+        int limit = s.Pane.Right - D(12);
+        bool zoomShown = false;
+        if (s.ZoomBtn != null)
+        {
+            // 网格和队列同一个按钮：队列里只有中间那张有。
+            // 该不该显示先在这儿算好再设，不回头读 Visible：窗体没显示时读回来一律是 false（它连父窗口一起算），
+            // 离屏测试里这个按钮就一直没摆上位置。
+            zoomShown = _slots.Count > 1 && (!_queueMode || s == QueueFront);
+            bool zoomedHere = _queueMode ? (_queueZoom && s == QueueFront) : _solo == s;
+            SetChip(s.ZoomBtn, zoomedHere ? "还原" : "放大", zoomedHere ? "" : "");
+            // 格子窄到两个都放不下时，先藏「放大」（双击表头照样能放大）
+            if (zoomShown && x + chipW + chipGap + chipW > limit) zoomShown = false;
+            if (zoomShown) { s.ZoomBtn.Bounds = new Rectangle(x, top, chipW, chipH); x += chipW + chipGap; }
+            s.ZoomBtn.Visible = zoomShown;
+        }
+        s.DropBtn.Bounds = new Rectangle(x, top, chipW, chipH);
+        s.DropBtn.Visible = x + chipW <= limit;
     }
 
     // 表头右边那两个小按钮：上面是一个图标（Segoe Fluent Icons / MDL2 里的字形），是干什么的写在悬停提示里。
@@ -319,7 +351,8 @@ internal sealed partial class HostForm
                 ? (s.AgentState == "working" ? 2 : s.AgentState == "asking" ? 5 : s.DoneUnseen ? 4 : (s.AgentState == null ? 0 : 3))
                 : 0;
         }
-        else if (s.StateLbl.Text != "正在启动…" && s.StateLbl.Text != "没找到启动入口")
+        else if (s.StateLbl.Text != "正在启动…" && s.StateLbl.Text != "没找到启动入口"
+            && s.StateLbl.Text != "在更新，装完再启动…" && s.StateLbl.Text != "开了没窗口，可能在更新")
         {
             s.StateLbl.Text = "没找到窗口";
             s.StateLbl.Tone = 0;
@@ -363,8 +396,20 @@ internal sealed partial class HostForm
     // name：侧栏方块上没有名字，那里传表头的全名进来（终端会话带着项目：「Codex CLI · 项目」）
     static string AgentTip(Slot s, string name = null)
     {
-        if (!s.Embedded || s.AgentState == null) return null;
-        return TipNotes.Tip(name ?? s.Kind.Name, s.AgentState, s.AgentSecs, s.AgentNote);
+        // 别的 agent 留给这一家、它还没看的话：提示最后多一行（几条、谁留的）。没有就没有这一行
+        string notes = s.Custom ? null : NoteCounts.Line(s.Kind.FamilyId);
+        // 再加一行它整棵进程树占多少内存（MemStats；还没扫到就没有）—— 几家一起开内存吃紧时先看得见谁在吃
+        string mem = s.Embedded ? MemStats.Line(s.Hwnd) : null;
+        string tip;
+        if (!s.Embedded || s.AgentState == null) tip = notes == null && mem == null ? null : (name ?? s.Kind.Name);
+        else tip = TipNotes.Tip(name ?? s.Kind.Name, s.AgentState, s.AgentSecs, s.AgentNote);
+        if (tip == null) return null;
+        if (notes != null) tip += "\r\n" + notes;
+        if (mem != null) tip += "\r\n" + mem;
+        // 当前对话上下文多长（长对话提醒那条线是 25 万；钩子量到了才有这一行）
+        if (s.Embedded && s.AgentNote != null && s.AgentNote.Ctx > 0)
+            tip += "\r\n" + L.F("上下文约 {0} 万", Math.Round(s.AgentNote.Ctx / 10000.0, s.AgentNote.Ctx < 100000 ? 1 : 0));
+        return tip;
     }
 
     // 多了几行字，默认 5 秒就收起来读不完
@@ -471,7 +516,7 @@ internal sealed partial class HostForm
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
         // 子控件重画时也会走到这里（PaintUnder），只画跟重画区域相交的那几块。
         Rectangle clip = Rectangle.Inflate(e.ClipRectangle, D(24), D(24));
-        if (clip.IntersectsWith(_pill))
+        if (!_full && clip.IntersectsWith(_pill))   // 全屏时没有工具条（_pill 是空的，空矩形照样算「相交」）
         {
             int tx = _pill.X + BarPad;
             // 还没排过版就先画了一次（.NET 10 启动时会）：那一次现量
@@ -514,7 +559,8 @@ internal sealed partial class HostForm
                     using (GraphicsPath hp = Theme.Round(new RectangleF(p.X, p.Y, p.Width, p.Height), D(10)))
                     using (var hb = new SolidBrush(Theme.BtnHot))
                         g.FillPath(hb, hp);
-                if (_slots[i].IconBmp != null) Theme.Icon(g, _slots[i].IconBmp, ChipIconRect(_slots[i]), D(4), D(7));
+                if (_slots[i].IconBmp != null)
+                    Theme.Icon(g, _slots[i].IconBmp, ChipIconRect(_slots[i]), D(4), D(7));
                 continue;
             }
             Theme.Card(g, p, D(12), Pane, _scale);

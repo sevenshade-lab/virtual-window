@@ -4,8 +4,13 @@
 //   node agenthost-hook.cjs <kind> [事件名]   事件 JSON 从 stdin 进来（各家的钩子都这么传）；
 //                                            载荷里不带事件名的（Antigravity）安装时把事件名写在第二个参数
 //
-// 只做观察：不拦截、不改输入、不往模型看得见的地方写字。标准输出一律不写 ——
-// 唯一例外是 Cursor 的 beforeSubmitPrompt：它要求回一句 {"continue":true}，不回会卡住提交。
+// 不拦截、不改输入。标准输出只在两种时候写：
+//   - Cursor 的 beforeSubmitPrompt：它要求回一句 {"continue":true}，不回会卡住提交；
+//   - 这一家有别的 agent 留的话还没看（留言，见 agenthost-notes.cjs）：会话开始 / 用户发话时把它们交给模型（noteFor）；
+//     它这一轮做完时有从没送到过的新留言，就把它叫住接着处理完再停（endNote）。
+//     信箱空着就跟以前一样什么都不写。
+// 会话派了活（建委托单、给别家留言、排进 Codex 主对话）的那一下工具调用，顺手替它记下要等的回音（agenthost-wake.cjs），
+// 挂着等、等到了叫醒它的是另一条 Stop 钩子；这里不写标准输出。
 // 需要回答「放行 / 拦截」的事件（Cursor 的 preToolUse / beforeShellExecution …）根本不注册，
 // 免得替用户批准命令。
 //
@@ -154,6 +159,257 @@ function replyOf(event, p) {
   return '';
 }
 
+// ---- 留言：别的 agent 留给这一家的话，趁会话开始 / 用户发话交给模型 ----
+//
+// 存取都在 agenthost-notes.cjs（装钩子时跟本文件释放到同一个目录；没有它就当没有留言这回事）。
+// 各家把一段话交给模型的办法不一样，只在确实交得进去的事件上送：
+//   Claude / Codex   SessionStart、UserPromptSubmit：回 hookSpecificOutput.additionalContext
+//                    （Claude 桌面端 2026-10-12 实测收得到；Codex 照它的钩子文档，作为 developer 消息进对话）
+//   Cursor           sessionStart：回 additional_context。文档说会进对话开头的上下文，论坛上有人报过某些版本不进 ——
+//                    所以照送，但不记成「送到过」（记了它却没看到，这条留言就再也不会提了）；
+//                    beforeSubmitPrompt 只能放行 / 拦截，交不了
+//   Antigravity      PreInvocation：回 injectSteps，往对话里插一条系统消息（2026-10-12 拿它的命令行 agy 1.3.3 实测：
+//                    {systemMessage:{systemMessage:"…"}} 和 {ephemeralMessage:"…"} 模型都看得到，systemMessage 直接给字符串的不行；
+//                    用前一种，留在对话里，后面几步还看得到编号）。每次调模型之前都发这个事件，只在一轮的头一次送
+//   OpenCode         走插件（agenthost-opencode.js），不经这里
+// 不该收的会话不送 —— 它们收了，真正在干活的那个会话就看不到了：
+//   - 子 agent、Cursor 代跑的 Claude 钩子；
+//   - 无头调用：别的程序起来问一句话就走的（Claude 的入口是 sdk-*、Codex 的 exec）；起它的程序也可以带环境变量
+//     AGENTHOST_NOTES=off 明说不要；
+//   - Codex 自己派生的小对话：审查模型、子 agent（对话记录第一行的 source 是个对象），还有每轮做完后生成
+//     「下一句建议」的那种（不落盘，没有对话记录可读）。
+// 一条留言算处理完只有一个标准：有人标了已读。没标之前，这一家的每个会话各被告知一次（notes.forSession 记着
+// 每个会话见过哪些）：头一次轮到（会话开始，或者钩子是半路装上的、那一家不发 SessionStart）没标已读的都提一遍，
+// 之后只送新来的。不是「谁先碰上归谁」—— 上面那几种认不出来的无头调用碰上了，也只是多看一眼，拿不走。
+let notes = null;
+try { notes = require('./agenthost-notes.cjs'); } catch {}
+// 等回音（agenthost-wake.cjs）：这个会话派了活（建委托单、给别家留言、排进 Codex 主对话），钩子替它记下要等什么；
+// 真正挂着等、等到了叫醒它的是另一条 Stop 钩子（asyncRewake，只有 Claude 有）。没有这个脚本就当没这回事
+let wake = null;
+try { wake = require('./agenthost-wake.cjs'); } catch {}
+// 长对话提醒（agenthost-hygiene.cjs）：一轮开头 / 结尾量一下上下文多长，过线（默认 25 万）就在送得进话的那个事件上
+// 提醒它「做完手头的事；有后续先登进待办、再交接」。没有这个脚本就当没这回事
+let hygiene = null;
+try { hygiene = require('./agenthost-hygiene.cjs'); } catch {}
+// 在哪个事件上量（一轮开头、结尾；Cursor 的 afterAgentResponse 带着这一轮的用量）
+const HYG_MEASURE = {
+  claude: new Set(['UserPromptSubmit', 'Stop']),
+  codex: new Set(['UserPromptSubmit', 'Stop']),
+  // 命令行版（cursor-agent）只发 postToolUse / sessionEnd，不发 afterAgentResponse / stop（11-07 实测）：工具调用后也量
+  cursor: new Set(['afterAgentResponse', 'stop', 'postToolUse']),
+  antigravity: new Set(['PreInvocation', 'Stop']),
+};
+// 在哪个事件上送提醒：Claude / Codex 用户发话时（additionalContext）；Antigravity 一轮头一次调模型前（injectSteps）；
+// Cursor 的 beforeSubmitPrompt 交不进话（Cursor 11-07 确认），改在 postToolUse 用 additional_context 送
+const HYG_SEND = { claude: 'UserPromptSubmit', codex: 'UserPromptSubmit', antigravity: 'PreInvocation', cursor: 'postToolUse' };
+// main 量到的这个会话的长度（没量返回 null）
+let measured = null;
+// 这条事件来之前，这个会话记着的那条记录（main 读到就放在这儿；没有记录是 null）
+let before = null;
+
+//
+// 还有一种送法：这一轮做完时（end）。它忙的工夫来了新留言、又一直没人跟它说话的话，上面两种时机都等不到 ——
+// 所以它这一轮要停的时候看一眼：有从没送到过的新留言，就把它叫住接着处理完再停。各家叫住的办法：
+//   Claude / Codex   Stop：回 {"decision":"block","reason":…}，reason 交给模型接着干（载荷里 stop_hook_active 为真
+//                    说明它已经是被叫住之后又停的，不再叫）
+//   Cursor           stop：回 {"followup_message":…}，它当成下一句用户的话自己发出去（loop_count > 0 说明已经是自己接的话；
+//                    status 不是 completed 的 —— 被你按停、出错 —— 不接）。它是 Cursor 唯一一个每一轮都交得进话的口子
+//   Antigravity      Stop：回 {"decision":"continue","reason":…}，reason 作为系统消息插进对话（fullyIdle=false 是半路暂停，不叫）
+//   OpenCode         在插件里（会话闲下来时替它发一句），不经这里
+// 一个会话一轮只叫住一次（notes.turnSpent / markTurn，用户再发话时清掉），而且只为「从没送到过的」叫 ——
+// 一条留言最多叫住一个会话一次。放一个 notes\turnend.off 就只关这一种送法。
+const NOTE_PHASE = {
+  claude: { SessionStart: 'start', UserPromptSubmit: 'prompt', Stop: 'end' },
+  codex: { SessionStart: 'start', UserPromptSubmit: 'prompt', Stop: 'end' },
+  cursor: { sessionStart: 'start', stop: 'end' },
+  antigravity: { PreInvocation: 'prompt', Stop: 'end' },
+};
+const NOTE_UNSURE = new Set(['cursor']);
+// 做完时那一种送法送不送得到还没在真机上对上的：照送，但不记成「送到过」（跟 NOTE_UNSURE 一个道理）。
+// Cursor 的 followup_message 是照它的钩子文档写的，桌面端还没亲眼见过
+const END_UNSURE = new Set(['cursor']);
+// 这次事件要把它叫住接着干：会话文件里别记成「做完了」（main 用）
+let keepWorking = false;
+
+function sessionOf(p) {
+  const raw = kind === 'antigravity'
+    ? pick(p, 'conversationId', 'conversation_id')
+    : pick(p, 'session_id', 'sessionId', 'conversation_id', 'conversationId');
+  return /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(raw) ? raw : '';
+}
+
+// Codex 对话记录的第一行：这条对话的身份（session_meta）。里面带着整段系统提示，可以有几十 KB，最多读 2MB 找换行。
+// 读不到文件返回 null；读到了但认不出格式返回 {}（以后它改了格式也照送，不至于悄悄一条都不送）
+function codexThread(p) {
+  const tp = pick(p, 'transcript_path', 'transcriptPath');
+  if (!tp) return null;
+  let fd;
+  try {
+    fd = fs.openSync(tp, 'r');
+    const parts = [];
+    let pos = 0;
+    while (pos < (2 << 20)) {
+      const b = Buffer.allocUnsafe(64 << 10);
+      const n = fs.readSync(fd, b, 0, b.length, pos);
+      if (n <= 0) break;
+      const got = b.subarray(0, n);
+      const nl = got.indexOf(10);
+      if (nl >= 0) { parts.push(got.subarray(0, nl)); break; }
+      parts.push(got);
+      pos += n;
+    }
+    try {
+      const j = JSON.parse(Buffer.concat(parts).toString('utf8'));
+      return j && j.payload && typeof j.payload === 'object' ? j.payload : {};
+    } catch { return {}; }
+  } catch { return null; } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
+}
+
+// 这个会话不该收留言的原因；该收返回空串。
+//   forced  起它的程序明说了要（AGENTHOST_NOTES=on）。只免掉「无头调用」这一条 —— 环境变量会一路传给它起的子 agent、
+//           它派生的小对话，那些照样不收（独立审查实测：以前带着 on 的子 agent、Codex 的小对话、Cursor 代跑的钩子都收得到）
+//   phase   这次是哪种时机（start / prompt / end）
+function noteSkip(p, forced, phase) {
+  if (/^(0|off|no|false)$/i.test(process.env.AGENTHOST_NOTES || '')) return 'AGENTHOST_NOTES=off';
+  if (p.agent_id || p.agentId || p.subagent_id) return 'subagent';
+  if (kind === 'claude') {
+    if (p.cursor_version) return 'claude hook run by cursor';
+    const entry = process.env.CLAUDE_CODE_ENTRYPOINT || '';
+    if (!forced && (/^sdk/i.test(entry) || entry === 'mcp')) return 'headless (' + entry + ')';
+  }
+  if (kind === 'codex') {
+    const t = codexThread(p);
+    if (!t) return 'no transcript (helper thread)';
+    if (t.source && typeof t.source === 'object') return 'spawned thread';
+    if (!forced && t.source === 'exec') return 'headless (exec)';
+  }
+  // Antigravity 每次调模型之前都发 PreInvocation：只在一轮的头一次送，别在它干到一半时插话。
+  // 头一次 = 这是第 0 次调用，或者这条事件来之前它不在干活（上一轮做完了、还没有记录）——
+  // 后一条是防着调用次数是整个对话累计的、不是每轮从 0 数。只管「用户发话」那个时机（before 是 main 读到的上一条记录）
+  if (phase === 'prompt' && kind === 'antigravity' && Number(p.invocationNum) > 0 && before && before.state === 'working') return 'mid-turn';
+  return '';
+}
+
+// 这一下工具调用是不是在用留言：给别家留言、看信箱、标已读、问别家的那几个工具，或者直接在命令行里调留言脚本
+//（没有那几个工具的家、工具进程还是旧的）。认错了也不要紧 —— 只是让这个会话在做完时也可以被叫住（见 notes.holdable）
+const NOTE_TOOL = /agent[-_]?bus|agent_(send|inbox|ack|peers)|ask_agent/i;
+function usedNotes(p, raw) {
+  if (NOTE_TOOL.test(pick(p, 'tool_name', 'toolName', 'toolCall.name', 'tool.name'))) return true;
+  return raw.length <= 262144 && raw.indexOf('agenthost-notes.cjs') >= 0;
+}
+
+function noteReply(event, text) {
+  if (cursorKind) return { additional_context: text };
+  // Antigravity：往对话里插一条系统消息
+  if (kind === 'antigravity') return { injectSteps: [{ systemMessage: { systemMessage: text } }] };
+  return { hookSpecificOutput: { hookEventName: event, additionalContext: text } };
+}
+
+// 回应写成纯 ASCII 的 JSON（汉字写成 \uXXXX）：有的家是经 PowerShell 起的钩子（Codex），标准输出按系统代码页转一道，
+// 直接写 UTF-8 的汉字到了它那儿可能是乱码或问号；转义之后哪种代码页都原样。
+function asciiJson(o) {
+  return JSON.stringify(o).replace(/[\u007f-\uffff]/g, ch => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'));
+}
+
+// 这一轮要停了，可这次停不是「做完了、可以接着干别的」的那种；是就返回原因
+function stopSkip(p) {
+  if (kind === 'cursor') {
+    // 明说了是做完的才接话：被你按停的、出错的不接；连 status 都没带的也不接（不知道它是怎么停的）
+    const status = pick(p, 'status');
+    if (status !== 'completed') return 'status ' + (status || 'missing');
+    if (Number(p.loop_count) > 0) return 'already a follow-up (loop_count)';
+    return '';
+  }
+  if (kind === 'antigravity') return p.fullyIdle === false ? 'not fully idle' : '';
+  return p.stop_hook_active === true ? 'stop hook already active' : '';
+}
+
+function endReply(text) {
+  if (cursorKind) return { followup_message: text };
+  if (kind === 'antigravity') return { decision: 'continue', reason: text };
+  return { decision: 'block', reason: text };
+}
+
+// 这一轮做完了：有从没送到过的新留言，就把它叫住接着处理。要叫住返回那条回应，不叫返回 null
+function endNote(event, p) {
+  if (typeof notes.turnSpent !== 'function') return null;   // 留言脚本是旧的（没跟着一起换）：当没有这种送法
+  const c = notes.counts(kind);
+  if (!c.new) return null;                      // 没有从没送到过的：最常见的情况，到此为止
+  const session = sessionOf(p);
+  if (!session) return null;
+  const log = what => notes.logDelivery(kind, event, session, what + ' (new ' + c.new + ', open ' + c.open + ')');
+  if (notes.deliveryOff(kind)) { log('skip: deliver.off'); return null; }
+  if (notes.turnEndOff(kind)) { log('skip: turnend.off'); return null; }
+  const forced = /^(1|on|yes|true)$/i.test(process.env.AGENTHOST_NOTES || '');
+  const why = noteSkip(p, forced, 'end') || stopSkip(p);
+  if (why) { log('skip: ' + why); return null; }
+  if (notes.turnSpent(kind, session)) { log('skip: already held once this turn'); return null; }
+  // 同一家开着几个会话：留给这一阵在跟别家打交道的那个（它不来的话，留言照常在下次有人发话时送）
+  if (typeof notes.holdable === 'function' && !notes.holdable(kind, session)) {
+    log('skip: left for the session of this agent that has been using notes');
+    return null;
+  }
+  const r = notes.forSession(kind, session, { end: true, unsure: END_UNSURE.has(kind) });
+  if (!r.text) return null;
+  notes.markTurn(kind, session);
+  if (wake && typeof wake.remember === 'function') wake.remember(kind, session, r.shown);
+  log('held at turn end: sent ' + r.shown.length + ' of ' + r.total + ' unread'
+    + (r.moved && r.moved.length ? ', ' + r.moved.length + ' now open' : '') + (forced ? ' (forced)' : ''));
+  return endReply(r.text);
+}
+
+// 这个事件要不要带上留言。要就返回那条回应（写到标准输出），不要返回 null
+function noteFor(event, p) {
+  if (!notes) return null;
+  const phase = NOTE_PHASE[kind] && NOTE_PHASE[kind][event];
+  if (!phase) return null;
+  if (phase === 'end') return endNote(event, p);
+  const c = notes.counts(kind);
+  if (!c.new && !c.open) return null;           // 信箱空着：最常见的情况，到此为止
+  const session = sessionOf(p);
+  const log = what => notes.logDelivery(kind, event, session, what + ' (new ' + c.new + ', open ' + c.open + ')');
+  // 没送的原因只在还有「没送到过的」时记：不然每个不该收的小对话每发一句话都记一行
+  if (notes.deliveryOff(kind)) { if (c.new) log('skip: deliver.off'); return null; }
+  // 起它的程序明说了要（AGENTHOST_NOTES=on）：无头的也送 —— 专门起来替这一家处理留言的就是这种
+  const forced = /^(1|on|yes|true)$/i.test(process.env.AGENTHOST_NOTES || '');
+  const why = noteSkip(p, forced, phase);
+  if (why) { if (c.new) log('skip: ' + why); return null; }
+  // 这个会话还没见过哪些、头一次轮到要不要都提一遍、记成送到过：都在 forSession 里
+  const r = notes.forSession(kind, session, { start: phase === 'start', unsure: NOTE_UNSURE.has(kind) });
+  if (!r.text) return null;
+  // 念给它了：它在等回音的话记一笔，回音要是就在这里头，就不用再为它叫醒一次
+  if (wake && typeof wake.remember === 'function') wake.remember(kind, session, r.shown);
+  log('sent ' + r.shown.length + ' of ' + r.total + ' unread' + (r.stale ? ', ' + r.stale + ' stale' : '')
+    + (r.moved && r.moved.length ? ', ' + r.moved.length + ' now open' : '') + (forced ? ' (forced)' : ''));
+  return noteReply(event, r.text);
+}
+
+// 这次要不要带上长对话提醒：要就返回提醒正文，不要返回 ''。量是 main 做的（measured），这里只看该不该送
+function hygieneFor(event, p) {
+  if (!hygiene || HYG_SEND[kind] !== event) return '';
+  const session = sessionOf(p);
+  if (!session) return '';
+  // 跟留言一样：子 agent、Cursor 代跑的 Claude 钩子、无头调用、Antigravity 一轮中间都不送
+  // 起它的程序明说了要（AGENTHOST_NOTES=on）：无头的也送（拿命令行实测送不送得到时用）
+  if (noteSkip(p, /^(1|on|yes|true)$/i.test(process.env.AGENTHOST_NOTES || ''), 'prompt')) return '';
+  const rec = hygiene.load(kind, session);
+  if (!hygiene.due(rec)) return '';
+  hygiene.markWarned(rec);
+  return hygiene.reminder(rec);
+}
+
+// 留言的回应里再并进一段话（长对话提醒）；没有留言就单独成一条回应
+function withText(event, note, text) {
+  if (!text) return note;
+  if (!note) return noteReply(event, text);
+  if (note.hookSpecificOutput) note.hookSpecificOutput.additionalContext = (note.hookSpecificOutput.additionalContext || '') + '\n\n' + text;
+  else if (Array.isArray(note.injectSteps)) note.injectSteps.push({ systemMessage: { systemMessage: text } });
+  else if ('additional_context' in note) note.additional_context = (note.additional_context || '') + '\n\n' + text;
+  return note;
+}
+
 function readRec(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
@@ -209,6 +465,16 @@ function main(raw) {
   const dir = path.join(base, 'sessions');
   const file = path.join(dir, kind + '-' + sessionId + '.json');
   const prev = readRec(file);
+  before = prev;
+  // 这个会话在用留言（它自己或者它的子 agent 调了那几个工具）：记一下，做完时优先叫住它；会话结束了就撤掉
+  if (notes && typeof notes.markTalk === 'function' && sessionId !== 'nosession') {
+    if (SESSION_END.has(event)) notes.clearTalk(kind, sessionId);
+    else if (WORKING.has(event) && usedNotes(p, raw)) notes.markTalk(kind, sessionId);
+  }
+  // 派活 / 看留言的那一下工具调用：登记这个会话要等的回音（见 agenthost-wake.cjs）。子 agent 派的活也算主对话的
+  if (wake && event === 'PostToolUse' && sessionId !== 'nosession') {
+    try { wake.onTool(kind, sessionId, p); } catch {}
+  }
   // 子 agent 的事件不算一张卡片：不新建记录，不改主对话的状态、事件、工具。
   // 但它说明这个会话还有活在跑 —— 主对话记着「在干活」的话把时刻刷新一下。不然子 agent / workflow 一跑二十几分钟
   // （这段时间主对话自己一条事件都没有），宿主会当它没动静、闲着了。主对话已经做完、正在问你的不动。
@@ -226,8 +492,35 @@ function main(raw) {
     }
     return;
   }
+  // 用户又发话了：这个会话这一轮还没被叫住过（见 endNote）。Antigravity 每次调模型之前都发 PreInvocation，
+  // 它没有别的「已经被叫住过」的标记，全靠这个记号：只要上一条记录还是「在干活」就不清 —— 被叫住时记的正是「在干活」，
+  // 所以被叫住之后接着调模型的那几次怎么编号（从 0 重新数也好、接着数也好）都清不掉它，要等这一轮真做完、用户再发话
+  if (notes && typeof notes.clearTurn === 'function' && TURN_START.has(event) && sessionId !== 'nosession'
+    && !(kind === 'antigravity' && prev && prev.state === 'working')) {
+    notes.clearTurn(kind, sessionId);
+  }
+  // 查「某一家量不到长度」用：放一个 hygiene\dump.on，就把这家载荷里有哪些键、数字字段是多少记到 hygiene\dump.log（不记正文）
+  if (hygiene && fs.existsSync(path.join(hygiene.DIR, 'dump.on'))) {
+    try {
+      const nums = {};
+      for (const k of Object.keys(p)) if (typeof p[k] === 'number' || typeof p[k] === 'boolean') nums[k] = p[k];
+      fs.appendFileSync(path.join(hygiene.DIR, 'dump.log'), JSON.stringify({ at: Date.now(), kind, event, session: sessionId, keys: Object.keys(p), nums,
+        transcript: pick(p, 'transcript_path', 'transcriptPath'), cwd: pick(p, 'cwd'), roots: p.workspace_roots }) + '\n');
+    } catch {}
+  }
+  // 长对话：一轮开头 / 结尾量一下（Antigravity 一轮中间每次调模型都发 PreInvocation，只量头一次）
+  if (hygiene && sessionId !== 'nosession' && HYG_MEASURE[kind] && HYG_MEASURE[kind].has(event)
+    && !(kind === 'antigravity' && event === 'PreInvocation' && Number(p.invocationNum) > 0 && prev && prev.state === 'working')) {
+    try {
+      const m = hygiene.measure(kind, sessionId, p);
+      const where = pick(p, 'cwd') || (Array.isArray(p.workspace_roots) && p.workspace_roots[0]) || process.cwd();
+      if (m.tokens) { hygiene.record(kind, sessionId, m, { cwd: where }); measured = m; }
+    } catch {}
+  }
   const review = kind === 'codex' && event === 'PermissionRequest' ? codexReviewer(p) : '';
-  const state = stateOf(event, p, review);
+  let state = stateOf(event, p, review);
+  // 这次停被叫住了、要接着处理留言：不算做完，还在干活
+  if (keepWorking && TURN_END.has(event)) state = 'working';
   if (state === null && prev) return;   // 不改状态的事件，已有记录就别动
   const slot = process.env.AGENTHOST_SLOT || '';
   const cwd = pick(p, 'cwd') || (Array.isArray(p.workspace_roots) && p.workspace_roots[0]) || process.cwd();
@@ -252,6 +545,11 @@ function main(raw) {
     entry: kind === 'claude' ? (process.env.CLAUDE_CODE_ENTRYPOINT || '') : '',
     reply,
   };
+  // 上下文多长（宿主悬停提示用）、对话记录在哪（待办脚本读对话标题用）：没量的事件沿用上一条
+  const ctx = measured ? measured.tokens : (prev && prev.ctx) || 0;
+  if (ctx) { rec.ctx = ctx; if (measured ? measured.approx : prev && prev.ctxApprox) rec.ctxApprox = true; }
+  const transcript = pick(p, 'transcript_path', 'transcriptPath') || (prev && prev.transcript) || '';
+  if (transcript) rec.transcript = transcript;
   // 查到了归谁批就记下（查的时候看得见为什么亮 / 没亮黄灯）；别的事件不带
   if (review) rec.review = review;
   const tmp = file + '.' + process.pid + '.tmp';
@@ -286,12 +584,29 @@ let done = false;
 //（2026-09-25 实测：Cursor 调了几十次钩子、全部 exit 0，却一条记录都没有）。
 function finish() {
   if (done) return; done = true;
-  let event = '';
+  let event = '', p = {}, note = null;
+  // 这一轮要停的事件：先定要不要把它叫住处理留言 —— 要的话会话文件里就不能记成「做完了」。只是定下来、不往外写，
+  // 写会话文件还是在回话之前。别的事件照旧：会话文件写完了才看留言
+  let endPhase = false;
+  try {
+    const head = buf.charAt(0) === String.fromCharCode(0xFEFF) ? buf.slice(1) : buf;
+    const early = (head.trim() ? JSON.parse(head) : {}) || {};
+    const ev = process.argv[3] || pick(early, 'hook_event_name', 'hookEventName', 'event');
+    endPhase = !!(NOTE_PHASE[kind] && NOTE_PHASE[kind][ev] === 'end');
+    // 送不送得到没把握的那几家（END_UNSURE）不改灯：它要是不认这条回应，灯会白白停在「在干活」上二十分钟
+    if (endPhase) { note = noteFor(ev, early); keepWorking = !!note && !END_UNSURE.has(kind); }
+  } catch { note = null; keepWorking = false; }
   try { main(buf); } catch {}
-  if (cursorKind) {
-    try { event = process.argv[3] || JSON.parse(buf.replace(/^﻿/, '') || '{}').hook_event_name || ''; } catch {}
+  try { p = JSON.parse(buf.replace(/^﻿/, '') || '{}') || {}; } catch { p = {}; }
+  try { event = process.argv[3] || pick(p, 'hook_event_name', 'hookEventName', 'event'); } catch {}
+  // 会话文件写完了才看留言：这一步再出什么岔子也不耽误灯
+  if (!endPhase) { try { note = noteFor(event, p); } catch { note = null; } }
+  // 长对话提醒：并进留言那条回应里（没有留言就单独回一条）
+  try { note = withText(event, note, hygieneFor(event, p)); } catch {}
+  if (cursorKind || note) {
     // Windows 上写管道是异步的：等写完再退，不然 {"continue":true} 可能丢，Cursor 会卡住提交
-    try { process.stdout.write(JSON.stringify(event === 'beforeSubmitPrompt' ? { continue: true } : {}), () => process.exit(0)); } catch { process.exit(0); }
+    const out = cursorKind && event === 'beforeSubmitPrompt' ? { continue: true } : (note || {});
+    try { process.stdout.write(asciiJson(out), () => process.exit(0)); } catch { process.exit(0); }
     setTimeout(() => process.exit(0), 500);
     return;
   }

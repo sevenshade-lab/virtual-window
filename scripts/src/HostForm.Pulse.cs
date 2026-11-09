@@ -159,6 +159,13 @@ internal sealed partial class HostForm
             // 状态来源：各家官方钩子写的会话文件（HookStates）+ 没钩子的看 CPU（CpuStates）。
             // 虚拟窗口是独立软件，不靠别的程序来判状态；外部程序只读它的数据。
             HookStates.Refresh();
+            // 留言：个数变了要重写 status.json；提示在下面 SyncTip 里跟着变。
+            // 图标上不再点数字（用户 2026-10-14：「不要这个红点最好」，Grok Bot 看完不标已读，红点一直挂着）
+            bool notesChanged = NoteCounts.Refresh();
+            // 待办：todo.json 变了（agent 登了一条、勾掉一条、兜底扫到）就跟着重排工具条底下那一行
+            SyncTodoStrip(TodoList.Load());
+            // 委托单：有新的待批单子就提一句（HostForm.Tasks.cs）
+            SyncTasks();
             var cliIds = new List<string>();
             foreach (Slot c in _slots) if (c.Kind.Cli) cliIds.Add(c.Kind.Id);
             CliStates.Refresh(cliIds);
@@ -224,15 +231,26 @@ internal sealed partial class HostForm
                     // asking（停在半路问你）跟 done 一样亮黄灯，而且更急
                     bool unseen = (st == "done" || st == "asking") && DateTime.Now.AddSeconds(-sec) > Seen.Of(s.Kind.Id);
                     s.DoneUnseen = unseen;
+                    bool grey = st != "working" && st != "asking" && !unseen;
+                    if (!grey) s.GreySince = DateTime.MinValue;
+                    else if (s.GreySince == DateTime.MinValue) s.GreySince = DateTime.Now;
                     RefreshAgentIndicator(s);
                     SyncTip(s);
                 }
-                if (agentStatusChanged) WriteStatus(true);
+                if (agentStatusChanged || notesChanged) WriteStatus(true);
                 if (agentStatusChanged || _queuePending) QueueAfterStates();
+                // 整机内存紧了（MemStats）：状态行提一句、点名占最多的那家，十分钟最多一次
+                WarnMemory();
                 bool anyUnseen = false;
-                for (int i = 0; i < _slots.Count; i++) if (_slots[i].DoneUnseen) anyUnseen = true;
+                // 靠 CPU 猜的「做完」不闪任务栏，理由同 SyncQueue 里不顶上来
+                for (int i = 0; i < _slots.Count; i++) if (_slots[i].DoneUnseen && !UsesCpu(_slots[i])) anyUnseen = true;
+                // 有委托等你签字也闪：跟「做完了」一样，你回到宿主就停（不加红点）
+                if (TaskList.Pending > 0) anyUnseen = true;
                 IntPtr fg2 = Native.GetForegroundWindow();
-                SyncFlash(anyUnseen, fg2 == Handle || Native.IsChild(Handle, fg2));
+                bool hostInFront = fg2 == Handle || Native.IsChild(Handle, fg2);
+                // 委托交了 / 验收过了：你不在宿主里时也闪，回到宿主（看到了状态那一行的提示）就停
+                if (TaskList.Announce) { if (hostInFront) TaskList.Announce = false; else anyUnseen = true; }
+                SyncFlash(anyUnseen, hostInFront);
             }
         }
 
@@ -247,12 +265,13 @@ internal sealed partial class HostForm
                 if (!_slots[i].Kind.Cli && !_slots[i].Custom && _slots[i].Embedded && _slots[i].Hwnd != IntPtr.Zero && Native.IsWindow(_slots[i].Hwnd))
                     live.Add(_slots[i].Hwnd);
             Qos.SyncAsync(live);
+            TrimIdle();
         }
-        if (_toast != null && DateTime.Now >= _toastUntil) { _toast = null; Invalidate(_pill); }
+        if (_toast != null && DateTime.Now >= _toastUntil) { _toast = null; _toastAction = null; Invalidate(_pill); }
         foreach (Slot pending in _slots)
             if (pending.Hwnd == IntPtr.Zero && pending.StateLbl.Text == "正在启动…"
                 && _launching.ContainsKey(pending.Kind.Id) && DateTime.Now >= _launching[pending.Kind.Id])
-            { pending.StateLbl.Text = "启动未完成，可重试"; pending.StateLbl.DotOnly = false; }
+                LaunchOverdue(pending);
         bool waiting = DateTime.Now < _lockUntil;
         bool anyEmpty = false;
         for (int i = 0; i < _slots.Count; i++)
@@ -401,6 +420,54 @@ internal sealed partial class HostForm
     }
 
     bool _pulseDirty;
+
+    DateTime _memWarnAt = DateTime.MinValue;
+
+    // 灯灰着满 TrimIdleMinutes、又不是你正看着的那一格：把它整棵进程树的内存收紧（MemStats.TrimAsync，
+    // 后台做、十分钟内不重复）。正看着的 = 队列视图中间那张、网格放大的那格、键盘焦点所在的格子。
+    // 设置里「闲着的格子收紧内存」可关（mem.trimidle）
+    const int TrimIdleMinutes = 5;
+
+    void TrimIdle()
+    {
+        if (!Prefs.Get("mem.trimidle", true)) return;
+        var roots = new Dictionary<int, string>();
+        Slot front = _queueMode ? QueueFront : _solo;
+        foreach (Slot s in _slots)
+        {
+            if (!s.Embedded || s.Hwnd == IntPtr.Zero || !Native.IsWindow(s.Hwnd)) continue;
+            if (s == front || s.Hwnd == _lastFocused) continue;
+            if (s.GreySince == DateTime.MinValue || DateTime.Now < s.GreySince.AddMinutes(TrimIdleMinutes)) continue;
+            uint pid;
+            Native.GetWindowThreadProcessId(s.Hwnd, out pid);
+            if (pid != 0) roots[(int)pid] = s.Kind.Name;
+        }
+        MemStats.TrimAsync(roots);
+    }
+
+    // 提交内存用掉九成、或物理内存只剩不到 1.5 GB：状态行提一句。宿主不替用户关谁（关掉哪家由用户定），
+    // 只把占最多的那家点出来，悬停它的表头能看到具体数字
+    void WarnMemory()
+    {
+        if (DateTime.Now < _memWarnAt) return;
+        string left;
+        if (!MemStats.Tight(out left)) return;
+        _memWarnAt = DateTime.Now.AddMinutes(10);
+        Slot top = null;
+        long most = 0;
+        foreach (Slot s in _slots)
+        {
+            if (!s.Embedded || s.Hwnd == IntPtr.Zero) continue;
+            uint pid;
+            Native.GetWindowThreadProcessId(s.Hwnd, out pid);
+            MemStats.Tree t = pid == 0 ? null : MemStats.Of((int)pid);
+            if (t != null && t.Bytes > most) { most = t.Bytes; top = s; }
+        }
+        string msg = top == null ? L.F("内存紧：整机还剩 {0}", left)
+                   : L.F("内存紧：整机还剩 {0}，{1} 占得最多（{2}）", left, top.Kind.Name, MemStats.Fmt(most));
+        Log.W("memory tight: " + msg);
+        ToastAct(msg, null, 15);
+    }
 
     // 这一格的状态靠不靠 CPU 兜底：自己挑进来的窗口、名单里没钩子的桌面端、除 Claude/Codex 以外的 CLI 会话
     static bool UsesCpu(Slot s)

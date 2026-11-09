@@ -3,7 +3,7 @@
 //   行为：四个开关（悬停切换焦点、空格组合键、完成时闪任务栏、关闭时一并关桌面端），每个带一行说明；
 //   状态灯：各家的状态钩子通没通 —— 装了没、最近一次收到是什么时候、没通的话卡在哪一步（Codex 要信任、OpenCode 要重启）；
 //           「重新安装钩子」一键重装；
-//   底部：Agent 名单、添加其他窗口、组合、日志。后两个是一串选项，点了关面板、在原处弹小菜单。
+//   底部：委托、添加其他窗口、组合、日志（Agent 名单在工具条上自己一个按钮）。后两个是一串选项，点了关面板、在原处弹小菜单。
 // 失去焦点就关；Esc 关闭。
 
 using System;
@@ -33,8 +33,7 @@ internal sealed partial class HostForm
             MethodInvoker act = p.Action;   // 失去焦点和点击都会关，FormClosed 可能来两遍：动作只取一次
             p.Action = null;
             if (act != null) BeginInvoke(act);
-            else if (giveBack != IntPtr.Zero && Native.IsWindow(giveBack) && SlotWithHwnd(giveBack) != null)
-                BeginInvoke((MethodInvoker)delegate { if (!_menuOpen) GiveFocus(giveBack, true); });
+            else GiveBackAfterPopup(giveBack);
         };
         p.Location = _settings.PointToScreen(new Point(0, _settings.Height + D(6)));
         p.Show(this);
@@ -61,10 +60,10 @@ internal sealed partial class HostForm
         menu.Closed += delegate
         {
             _menuOpen = false;
-            if (giveBack != IntPtr.Zero && Native.IsWindow(giveBack) && SlotWithHwnd(giveBack) != null)
-                BeginInvoke((MethodInvoker)delegate { if (!_menuOpen) GiveFocus(giveBack, true); });
+            GiveBackAfterPopup(giveBack);
         };
         ShellStyles.Menu(menu, Font, _scale);
+        TrackMenu(menu);
         menu.Show(_settings, new Point(0, _settings.Height));
     }
 
@@ -79,7 +78,7 @@ internal sealed partial class HostForm
         catch { Toast(L.T("打不开日志")); }
     }
 
-    internal sealed class SettingsPanel : Form
+    internal sealed class SettingsPanel : Form, IHostPopup
     {
         readonly HostForm _host;
         public MethodInvoker Action;
@@ -99,6 +98,7 @@ internal sealed partial class HostForm
             new[] { "notify", "1", "做完时闪烁任务栏", "某一家做完或在问你、而你不在虚拟窗口里时提醒一下" },
             new[] { "openagents", "1", "打开时一并启动桌面端", "打开虚拟窗口时把上次那几家没开着的桌面端一起启动" },
             new[] { "closeagents", "1", "关闭时一并关闭桌面端", "关掉虚拟窗口时把嵌着的桌面端一起关；终端会话留成独立窗口" },
+            new[] { "mem.trimidle", "1", "闲着的格子收紧内存", "灯灰了 5 分钟、又不是你正看着的那几家，把它们占的物理内存退给系统；一干活自动调回来" },
         };
 
         // 状态灯那一节列哪几家（有钩子的）
@@ -148,6 +148,8 @@ internal sealed partial class HostForm
             base.OnDeactivate(e);
             if (!_busy && !_closing && !IsDisposed) Close();
         }
+        // 点进了某一格（HostForm.Popups.cs）：忙着换色那一下不打断，其余直接关
+        public void DismissForSlotClick() { if (!_busy && !_closing && !IsDisposed) Close(); }
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
@@ -217,10 +219,24 @@ internal sealed partial class HostForm
             y += D(14);
 
             // 底部一排入口
-            string[][] foot = { new[] { "roster", "Agent 名单" }, new[] { "adopt", "添加其他窗口" }, new[] { "profile", "组合" }, new[] { "log", "日志" } };
-            int fw = inner / foot.Length;
+            // （Agent 名单 2026-10-24 挪到工具条上自己一个按钮）
+            string[][] foot = { new[] { "tasks", "委托" }, new[] { "adopt", "添加其他窗口" }, new[] { "profile", "组合" }, new[] { "log", "日志" } };
+            // 按字的宽度分：五个入口平均分的话「添加其他窗口」放不下（2026-10-15 加「委托」之后）
+            var fws = new int[foot.Length];
+            int need = 0;
             for (int i = 0; i < foot.Length; i++)
-                _items.Add(new Item { R = new Rectangle(Pad + i * fw, y + D(8), fw, D(34)), What = foot[i][0], Arg = foot[i][1] });
+            {
+                string arrow = foot[i][0] == "adopt" || foot[i][0] == "profile" ? " ▾" : "";
+                fws[i] = TextRenderer.MeasureText(L.T(foot[i][1]) + arrow, Font).Width;
+                need += fws[i];
+            }
+            int spare = Math.Max(0, inner - need), fx = Pad;
+            for (int i = 0; i < foot.Length; i++)
+            {
+                int fw = i == foot.Length - 1 ? Pad + inner - fx : fws[i] + spare / foot.Length;
+                _items.Add(new Item { R = new Rectangle(fx, y + D(8), fw, D(34)), What = foot[i][0], Arg = foot[i][1] });
+                fx += fw;
+            }
             y += D(8) + D(34) + D(12);
 
             ClientSize = new Size(W, y);
@@ -290,6 +306,8 @@ internal sealed partial class HostForm
                         string bad = rep.Find(l => l.Contains("失败") || l.Contains("没找到") || l.Contains("不敢动"));
                         _hookNote = bad == null ? L.T("已重装。新装的要重启那一家才生效；Codex 改过命令要重新信任") : (L.En ? L.T("有钩子没装上，详情见 hooks-report.txt") : bad);
                         HookStates.Refresh();
+                        // 留言认得哪几家要看钩子装没装：重查一遍
+                        host.SyncPeers();
                         Relayout();
                     }
                     break;
@@ -307,6 +325,10 @@ internal sealed partial class HostForm
                     break;
                 case "log":
                     Action = delegate { host.OpenLog(); };
+                    Close();
+                    break;
+                case "tasks":
+                    Action = delegate { host.ShowTasks(); };
                     Close();
                     break;
             }
@@ -468,7 +490,7 @@ internal sealed partial class HostForm
                                 Theme.Text(g, _hookNote, small, Theme.Dim, new RectangleF(Pad, it.R.Bottom, Width - Pad * 2, D(22)), StringAlignment.Near);
                             break;
                         default:   // 底部入口
-                            if (it.What == "roster")
+                            if (it.What == "tasks")
                                 using (var pen = new Pen(ShellStyles.Border))
                                     g.DrawLine(pen, Pad, it.R.Y - D(8), Width - Pad, it.R.Y - D(8));
                             if (hot)

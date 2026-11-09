@@ -146,7 +146,15 @@ internal sealed partial class HostForm
                 Slot fs = SlotOwning(hwnd);
                 if (fs == null && hwnd != Handle && !Native.IsChild(Handle, hwnd)) { _foreignFgAt = DateTime.Now; return; }
                 double fgAgo = (DateTime.Now - _foreignFgAt).TotalMilliseconds;
-                if (fs == null || SlotShowing(fs)) return;
+                if (fs == null) return;
+                if (SlotShowing(fs))
+                {
+                    // 格子就在前面，可宿主自己最小化着 / 被别的程序盖着：那家把自己设成前台也没人看得见
+                    // （用户 2026-10-15：点通知后虚拟窗口不会直接到前台）。刚从外面过来才管，
+                    // 真盖着才动（从外面直接点进格子时格子露着，不碰，免得抢掉这次点击）
+                    if (fgAgo < 2000) BeginInvoke((MethodInvoker)delegate { BringHostForward(fs, false); });
+                    return;
+                }
                 if (fgAgo >= 2000) { Log.W("notify " + fs.Kind.Id + ": 藏着的格子成了前台，但前台 " + (int)Math.Min(fgAgo, 99999) + "ms 前就不在外面了，不跳"); return; }
                 Log.W("notify " + fs.Kind.Id + ": 藏着的这一格把自己设成前台（多半点了它的通知），换到前面");
                 BeginInvoke((MethodInvoker)delegate { JumpTo(fs); });
@@ -172,7 +180,13 @@ internal sealed partial class HostForm
             }
             // 焦点事件：只看窗口本身（OBJID_CLIENT / 窗口），落在哪一格
             Slot s = SlotOwning(hwnd);
-            if (s == null || SlotShowing(s)) return;
+            if (s == null) return;
+            if (SlotShowing(s))
+            {
+                if ((DateTime.Now - _foreignFgAt).TotalMilliseconds < 2000)
+                    BeginInvoke((MethodInvoker)delegate { BringHostForward(s, false); });
+                return;
+            }
             // 宿主只会把焦点交给看得见的那一格，焦点落进藏着的格子不可能是宿主自己交的，
             // 不用再按「宿主刚交过焦点」挡 —— 那样会连真的点通知一起挡掉：点通知时宿主先被激活、
             // 先把焦点还给原来那格，紧跟着那家才聚焦自己，正好落在窗口期里。
@@ -208,13 +222,68 @@ internal sealed partial class HostForm
     void JumpTo(Slot s)
     {
         if (_closed || !_slots.Contains(s)) return;
-        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+        // 用 SW_RESTORE 还原，回到最小化之前的样子（原来最大化的还是最大化）；
+        // 以前设 WindowState = Normal，点一次通知宿主就从最大化变成普通窗口
+        if (Native.IsIconic(Handle)) Native.ShowWindow(Handle, Native.SW_RESTORE);
         if (_queueMode) PinFront(s);
         else if (_solo != null && _solo != s) ToggleSolo(s);
         // 没换上来（比如被在问你的那家挤回去了）就别把焦点塞进藏着的格子：
         // 它一拿焦点又报「藏着的格子成了前台」→ 又 JumpTo，2026-09-28 这样空转了 46 秒、25 轮动画，界面像卡死
         if (!SlotShowing(s)) { Log.W("jump " + s.Kind.Id + ": 没换到前面，不交焦点"); return; }
         if (s.Hwnd != IntPtr.Zero) { _focusByUser = true; GiveFocus(s.Hwnd, true); }
-        try { Native.SetForegroundWindow(Handle); } catch { }
+        BringHostForward(s, true);
+    }
+
+    // 把宿主窗口本身带到前台：最小化的还原，盖着的提到最上面。
+    // always=false 时只在真看不见（最小化 / 格子那块被别的程序盖着）才动。
+    // 点通知那一下，前台权限在那家手里（它把格子里的自己设成了前台），宿主直接 SetForegroundWindow
+    // 可能被前台锁挡掉；挡掉就短暂接上当前前台那个线程的输入再设一次，马上断开。
+    void BringHostForward(Slot s, bool always)
+    {
+        if (_closed || !Visible) return;
+        bool iconic = Native.IsIconic(Handle);
+        string covered = iconic ? null : CoveredBy(s);
+        if (!always && !iconic && covered == null) return;
+        if (iconic) Native.ShowWindow(Handle, Native.SW_RESTORE);
+        bool ok = false;
+        try { ok = Native.SetForegroundWindow(Handle); } catch { }
+        bool via = false;
+        if (!ok || Native.GetAncestor(Native.GetForegroundWindow(), Native.GA_ROOT) != Handle)
+        {
+            uint me = Native.GetCurrentThreadId(), pid;
+            uint fgThread = Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out pid);
+            if (fgThread != 0 && fgThread != me && Native.AttachThreadInput(me, fgThread, true))
+            {
+                try { ok = Native.SetForegroundWindow(Handle); via = true; }
+                finally { Native.AttachThreadInput(me, fgThread, false); }
+            }
+        }
+        if (always && !iconic && covered == null) return;   // 本来就露着，不用记
+        bool front = Native.GetAncestor(Native.GetForegroundWindow(), Native.GA_ROOT) == Handle;
+        Log.W("notify " + (s != null ? s.Kind.Id : "-") + ": 宿主" + (iconic ? "最小化着" : "被 " + covered + " 盖着")
+              + "，带到前台 " + (front ? "成了" : "没成（前台锁）") + (via ? "（借了前台线程的输入）" : ""));
+    }
+
+    // 格子那块（没有就窗口中间）最上面是不是别的程序的窗口；是就返回它的进程名，露着返回 null
+    string CoveredBy(Slot s)
+    {
+        var pts = new System.Collections.Generic.List<System.Drawing.Point>();
+        if (s != null && s.Site != null && s.Site.IsHandleCreated && s.Site.Width > 0 && s.Site.Height > 0)
+            pts.Add(s.Site.PointToScreen(new System.Drawing.Point(s.Site.Width / 2, s.Site.Height / 2)));
+        pts.Add(PointToScreen(new System.Drawing.Point(ClientSize.Width / 2, ClientSize.Height / 2)));
+        uint mine = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+        foreach (var pt in pts)
+        {
+            IntPtr w = Native.WindowFromPoint(new Native.POINT { X = pt.X, Y = pt.Y });
+            if (w == IntPtr.Zero) continue;
+            IntPtr root = Native.GetAncestor(w, Native.GA_ROOT);
+            if (root == Handle) continue;
+            uint pid;
+            Native.GetWindowThreadProcessId(root, out pid);
+            if (pid == mine) continue;   // 宿主自己的浮层（换人动画、签字小卡）
+            if (SlotOwning(w) != null) continue;
+            try { return System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; } catch { return "pid " + pid; }
+        }
+        return null;
     }
 }

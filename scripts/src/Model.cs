@@ -18,6 +18,7 @@ internal sealed class AgentKind
     public string[] Exes;          // 桌面端可能的安装位置（可含 %LOCALAPPDATA% 之类）
     public string[] Shortcuts;     // 开始菜单快捷方式名（装哪儿都找得到）
     public string AppsFolder;      // 商店版：shell:AppsFolder\<这个>
+    public string[] IconShortcuts; // 只拿来取图标的快捷方式名（只有命令行、自己没图标的：借同一家的网页应用 / 桌面端）
     public string CliCommand;      // CLI 命令名（不带扩展名）
     public string[] CliPaths;      // CLI 不在 PATH 时可能的位置
     public string Home;            // 没装时给的官网 / 安装地址
@@ -94,6 +95,8 @@ internal sealed class Slot
     public string TabNote;
     // 它做完的那一下，你有没有点进来看过（「你上次看这格」存在 Seen 里，跨重启）。
     public bool DoneUnseen;
+    // 灯什么时候开始灰着的（没在干活、没在问你、也不是做完没看）；MinValue = 现在不灰。闲够了收紧内存用（MemStats）
+    public DateTime GreySince;
     // 客户端自己把窗口藏起来（点了它自己的 ✕、收进托盘）是什么时候。
     public DateTime HiddenSince;
     // 窗口没了之后进入「待关」观察期：它自己又开回来就取消，真没回来才收进程树。

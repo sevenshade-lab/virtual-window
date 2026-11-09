@@ -1,4 +1,4 @@
-// 「＋ 新会话」面板上每家的图标。没在跑的也要有图标，所以不能只靠窗口的 WM_GETICON：
+// 「＋ 新会话」面板、设置页、Agent 名单上每家的图标。没在跑的也要有图标，所以不能只靠窗口的 WM_GETICON：
 //   安装版 → 从 exe 取；商店版（Claude / Codex）→ 走外壳 shell:AppsFolder\<AUMID> 取；
 //   只有开始菜单快捷方式的 → 从 .lnk 取；都没有 → 首字母圆形头像。取一次缓存。
 
@@ -12,12 +12,19 @@ using System.Runtime.InteropServices;
 internal static class AgentIcons
 {
     static readonly Dictionary<string, Bitmap> _cache = new Dictionary<string, Bitmap>();
+    // 程序文件暂时不在时取到的（正在自动更新）：只用一分钟就重取。
+    // 2026-10-27 宿主重开那一刻 Antigravity 在更新，exe 不在，快捷方式取出来是 Windows 默认的白纸图标，缓存住之后一直白着。
+    static readonly Dictionary<string, long> _retryAt = new Dictionary<string, long>();
 
     public static Bitmap Get(AgentKind k, int px)
     {
         string key = k.Id + "@" + px;
         Bitmap b;
-        if (_cache.TryGetValue(key, out b)) return b;
+        long retry;
+        if (_cache.TryGetValue(key, out b) && !(_retryAt.TryGetValue(key, out retry) && Environment.TickCount64 > retry)) return b;
+        _retryAt.Remove(key);
+        if (k.Exes != null && k.Exes.Length > 0 && Catalog.DesktopExe(k) == null && Catalog.HasDesktop(k))
+            _retryAt[key] = Environment.TickCount64 + 60000;
         b = null;
         try
         {
@@ -30,6 +37,12 @@ internal static class AgentIcons
             if (b == null && k.Shortcuts != null && k.Shortcuts.Length > 0)
             {
                 string lnk = Launch.FindShortcut(k.Shortcuts);
+                if (lnk != null) b = FromShell(lnk, px) ?? FromFile(lnk, px);
+            }
+            // 排在命令行 exe 前面：命令行程序多半不带图标，取出来是 Windows 默认的那个程序图标
+            if (b == null && k.IconShortcuts != null && k.IconShortcuts.Length > 0)
+            {
+                string lnk = Launch.FindShortcut(k.IconShortcuts);
                 if (lnk != null) b = FromShell(lnk, px) ?? FromFile(lnk, px);
             }
             if (b == null && Catalog.HasCli(k))

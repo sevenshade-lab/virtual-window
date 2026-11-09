@@ -17,10 +17,19 @@ using System.Text.Json.Nodes;
 internal static class HookSetup
 {
     public const string Marker = "agenthost-hook.cjs";
+    // 「等回音」那条 Stop 钩子（只有 Claude 有）：它调的是另一个脚本，也算我们自己的
+    public const string WakeMarker = "agenthost-wake.cjs";
+    // 它最多挂多久（秒）。Claude Code 照这里的数掐，不另设上限（2026-10-16 实测超过默认的 600 秒照样等）；
+    // 脚本自己 23.5 小时就走（agenthost-wake.cjs 的 LIFE），赶在被掐之前
+    const int WakeTimeout = 86400;
 
     static string Home { get { return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile); } }
     static string BaseDir { get { return Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA") ?? Home, "AgentHost"); } }
     public static string ScriptPath { get { return Path.Combine(BaseDir, "bin", "agenthost-hook.cjs"); } }
+    // 留言的存取和命令行（各家 agent 也直接调它）：跟钩子小程序放在一起，钩子按相对路径找它
+    public static string NotesScriptPath { get { return Path.Combine(BaseDir, "bin", "agenthost-notes.cjs"); } }
+    // 等回音：派出去的活有了回音，把派活的那个 Claude 会话叫醒（Stop 时挂着等的那条钩子调它，钩子小程序也用它登记）
+    public static string WakeScriptPath { get { return Path.Combine(BaseDir, "bin", "agenthost-wake.cjs"); } }
     public static string SessionsDir { get { return Path.Combine(BaseDir, "sessions"); } }
 
     static readonly string[] ClaudeEvents = { "SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Notification",
@@ -28,6 +37,8 @@ internal static class HookSetup
     static readonly string[] CodexEvents = { "SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop" };
     static readonly string[] CursorEvents = { "sessionStart", "beforeSubmitPrompt", "postToolUse", "afterAgentResponse", "stop", "sessionEnd" };
     static readonly string[] AntigravityEvents = { "PreInvocation", "PostInvocation", "PostToolUse", "Stop" };
+
+    public static string Node() { return NodeExe(); }
 
     static string NodeExe()
     {
@@ -117,7 +128,27 @@ internal static class HookSetup
         return obj;
     }
 
-    static bool Owned(JsonNode n) { return n != null && n.ToJsonString().Contains(Marker); }
+    static bool Owned(JsonNode n)
+    {
+        if (n == null) return false;
+        string s = n.ToJsonString();
+        return s.Contains(Marker) || s.Contains(WakeMarker);
+    }
+
+    // 等回音那条：Stop 时在后台挂着（asyncRewake：不挡这一轮结束，退出码 2 时把它的标准错误交给模型、叫醒会话）
+    static JsonObject WakeEntry(string node)
+    {
+        return new JsonObject
+        {
+            ["hooks"] = new JsonArray(new JsonObject
+            {
+                ["type"] = "command",
+                ["command"] = "\"" + node.Replace('\\', '/') + "\" \"" + WakeScriptPath.Replace('\\', '/') + "\" stop claude",
+                ["asyncRewake"] = true,
+                ["timeout"] = WakeTimeout
+            })
+        };
+    }
 
     // ---- 各家 ----
 
@@ -138,12 +169,37 @@ internal static class HookSetup
                 {
                     ["type"] = "command", ["command"] = Command(node, "claude"), ["timeout"] = 10
                 }) });
+            // 等回音：同一个 Stop 再挂一条后台的（跟上面那条各跑各的）
+            if (install && ev == "Stop") arr.Add(WakeEntry(node));
             if (arr.Count == 0) hooks.Remove(ev); else hooks[ev] = arr;
         }
         if (hooks.Count == 0) root.Remove("hooks"); else root["hooks"] = hooks;
         Backup(file);
         WriteAtomic(file, root.ToJsonString(Pretty));
-        return "Claude：" + (install ? "已装（" + ClaudeEvents.Length + " 个事件）" : "已卸") + " · " + file;
+        WakeSwitch(install);
+        return "Claude：" + (install ? "已装（" + ClaudeEvents.Length + " 个事件，外加做完时挂着等回音的那一条）" : "已卸") + " · " + file;
+    }
+
+    // 卸载时放一个 wake\wake.off（写明是卸载时放的）：已经挂着的等待进程见到它十秒内自己走，不会卸了钩子还把会话叫醒。
+    // 重新装上时只删这种；用户自己放的 wake.off 不动
+    const string WakeOffByUninstall = "uninstalled";
+
+    static void WakeSwitch(bool install)
+    {
+        try
+        {
+            string dir = Path.Combine(BaseDir, "wake");
+            string off = Path.Combine(dir, "wake.off");
+            if (install)
+            {
+                if (File.Exists(off) && File.ReadAllText(off).TrimStart().StartsWith(WakeOffByUninstall, StringComparison.Ordinal)) File.Delete(off);
+                return;
+            }
+            Directory.CreateDirectory(dir);
+            if (!File.Exists(off))
+                File.WriteAllText(off, WakeOffByUninstall + "（卸载钩子时放的：挂着的等待进程见到它就走；重新安装钩子时删掉）\n", new UTF8Encoding(false));
+        }
+        catch { }
     }
 
     // Cursor：~/.cursor/hooks.json {version:1, hooks:{<事件>:[{command,timeout}]}}
@@ -364,11 +420,27 @@ internal static class HookSetup
 
     static void ExtractScript()
     {
-        using (Stream s = typeof(HookSetup).Assembly.GetManifestResourceStream("agenthost-hook.cjs"))
+        // 先放留言那个：钩子小程序一换上就会去找它
+        Extract("agenthost-notes.cjs", NotesScriptPath, "exe 里没有嵌留言的脚本");
+        // 委托单的脚本：要用留言脚本（借留言通知对方），所以放在它后面、跟它同一个目录
+        Extract("agenthost-tasks.cjs", TaskList.ScriptPath, "exe 里没有嵌委托单的脚本");
+        // 等回音：要用前两个，钩子小程序要用它
+        Extract("agenthost-wake.cjs", WakeScriptPath, "exe 里没有嵌等回音的脚本");
+        // 它的清单目录由这里（不是商店版的进程）先建好：商店版的 Claude 在 %LOCALAPPDATA% 下新建的目录别的程序看不见
+        try { Directory.CreateDirectory(Path.Combine(BaseDir, "wake")); } catch { }
+        Extract("agenthost-hook.cjs", ScriptPath, "exe 里没有嵌钩子小程序");
+    }
+
+    // 写到 .tmp 再改名盖上去：各家的钩子随时在跑，别让它读到写了一半的脚本
+    static void Extract(string resource, string path, string missing)
+    {
+        using (Stream s = typeof(HookSetup).Assembly.GetManifestResourceStream(resource))
         {
-            if (s == null) throw new InvalidOperationException("exe 里没有嵌钩子小程序");
-            Directory.CreateDirectory(Path.GetDirectoryName(ScriptPath));
-            using (var f = File.Create(ScriptPath)) s.CopyTo(f);
+            if (s == null) throw new InvalidOperationException(missing);
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            string tmp = path + ".tmp";
+            using (var f = File.Create(tmp)) s.CopyTo(f);
+            File.Move(tmp, path, true);
         }
     }
 
@@ -380,7 +452,7 @@ internal static class HookSetup
         if (install)
         {
             if (node == null) { report.Add("没找到 Node.js（node.exe），装不了钩子：先装 Node.js 再来"); return report; }
-            try { ExtractScript(); report.Add("钩子小程序：" + ScriptPath); }
+            try { ExtractScript(); report.Add("钩子小程序：" + ScriptPath); report.Add("留言的脚本：" + NotesScriptPath); }
             catch (Exception ex) { report.Add("钩子小程序释放失败：" + ex.Message); return report; }
         }
         if (node == null) node = "node";
@@ -391,6 +463,30 @@ internal static class HookSetup
             catch (Exception ex) { report.Add(f.Method.Name + "：失败，没改 —— " + ex.Message); }
         }
         return report;
+    }
+
+    // 只装 / 卸一家（名单页每张卡的「⋯」菜单）。kind 不是有钩子的那五家返回 null
+    public static string ApplyOne(bool install, string kind)
+    {
+        Func<bool, string, string> f = null;
+        switch (kind)
+        {
+            case "claude": f = Claude; break;
+            case "codex": f = Codex; break;
+            case "cursor": f = Cursor; break;
+            case "antigravity": f = Antigravity; break;
+            case "opencode": f = OpenCode; break;
+        }
+        if (f == null) return null;
+        string node = NodeExe();
+        if (install)
+        {
+            if (node == null) return "没找到 Node.js（node.exe），装不了钩子：先装 Node.js 再来";
+            try { ExtractScript(); }
+            catch (Exception ex) { return "钩子小程序释放失败：" + ex.Message; }
+        }
+        try { return f(install, node ?? "node"); }
+        catch (Exception ex) { return f.Method.Name + "：失败，没改 —— " + ex.Message; }
     }
 
     public static List<string> ApplyToFile(bool install)

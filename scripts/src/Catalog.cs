@@ -7,6 +7,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
 
@@ -37,6 +38,7 @@ internal static class Catalog
         k.CliProcesses = new[] { "cursor-agent", "agent" };
         k.CliPaths = new[] { @"%LOCALAPPDATA%\cursor-agent\agent.cmd" };
         k.DesktopState = "hooks";
+        // 留言：Cursor 只有会话开始那一下交得进去，而且有的版本不认 —— 不算「钩子能自己送到」，图标上照点数字
         k.Chromium = true;
         // 不带参数启动 Cursor.exe 时，它先联网问 api2.cursor.sh「这次开哪种窗口」，再按 restoreWindows
         // 把上次的 IDE 窗口全恢复 —— 所以 IDE 会跟着一起开，网络慢时 Agents 窗迟迟不出、宿主等到超时
@@ -89,7 +91,10 @@ internal static class Catalog
         list.Add(k);
 
 
+        // 只有命令行，命令行程序自己不带图标（名单页上一直是个空灰圆，用户 2026-10-15 截图）：
+        // 借开始菜单里同一家的 Grok 网页应用 / Grok Bot 的图标
         k = K("grok", "Grok Build", new string[0], "grok", "https://x.ai");
+        k.IconShortcuts = new[] { "Grok", "Grok Bot" };
         list.Add(k);
 
 
@@ -153,6 +158,7 @@ internal static class Catalog
                         if (Str(e, "cli") != null) { k.CliCommand = Str(e, "cli"); k.CliProcesses = new[] { k.CliCommand }; }
                         if (Str(e, "cliPath") != null) k.CliPaths = new[] { Str(e, "cliPath") };
                         if (Str(e, "home") != null) k.Home = Str(e, "home");
+                        if (k.Custom) GuessShortcuts(k);
                     }
             }
         }
@@ -186,6 +192,8 @@ internal static class Catalog
     {
         string f = UserFile();
         if (f == null) throw new InvalidOperationException("找不到 LOCALAPPDATA");
+        // 程序位置没填：它正开着就照着进程找（2026-10-24 用户加 Gemini 只填了进程名，结果「启动」一直不出来）
+        if (string.IsNullOrWhiteSpace(c.Exe) && !string.IsNullOrWhiteSpace(c.Process)) c.Exe = RunningExe(c.Process.Trim());
         var arr = new System.Text.Json.Nodes.JsonArray();
         if (File.Exists(f))
         {
@@ -216,8 +224,110 @@ internal static class Catalog
         if (!string.IsNullOrWhiteSpace(c.Exe)) k.Exes = new[] { c.Exe.Trim() };
         if (!string.IsNullOrWhiteSpace(c.Cli)) { k.CliCommand = c.Cli.Trim(); k.CliProcesses = new[] { k.CliCommand }; }
         if (!string.IsNullOrWhiteSpace(c.Home)) k.Home = c.Home.Trim();
+        if (k.Custom) GuessShortcuts(k);
         _desktop.Remove(k.Id);
         return k;
+    }
+
+    // 自定义的没写快捷方式：开始菜单里跟名字或进程名同名的就算（大多数安装程序都这么建）
+    static void GuessShortcuts(AgentKind k)
+    {
+        if (k.Shortcuts != null && k.Shortcuts.Length > 0) return;
+        var names = new List<string> { k.Name };
+        if (k.Processes != null)
+            foreach (string p in k.Processes)
+                if (!names.Exists(n => string.Equals(n, p, StringComparison.OrdinalIgnoreCase))) names.Add(p);
+        k.Shortcuts = names.ToArray();
+    }
+
+    // 正在跑的进程的程序位置。Squirrel 装的（Gemini、Slack…）真身在 app-1.16.0\ 这种带版本号的目录里，
+    // 一更新就换目录，改记外面那层同名的启动器
+    public static string RunningExe(string process)
+    {
+        Process[] ps = new Process[0];
+        try { ps = Process.GetProcessesByName(process); } catch { }
+        try
+        {
+            foreach (Process p in ps)
+            {
+                string path = null;
+                try { path = p.MainModule?.FileName; } catch { }
+                if (string.IsNullOrEmpty(path)) continue;
+                string dir = Path.GetDirectoryName(path);
+                if (System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(dir) ?? "", @"^app-\d"))
+                {
+                    string outer = Path.Combine(Path.GetDirectoryName(dir), Path.GetFileName(path));
+                    if (File.Exists(outer)) return outer;
+                }
+                return path;
+            }
+        }
+        finally { foreach (Process p in ps) p.Dispose(); }
+        return null;
+    }
+
+    // ---- 从名单里藏起来（内置的删不掉，只能藏；prefs.txt 的 roster.hidden，逗号隔开）----
+
+    static HashSet<string> HiddenSet()
+    {
+        var h = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string s in (Prefs.GetStr("roster.hidden", "") ?? "").Split(','))
+            if (s.Trim().Length > 0) h.Add(s.Trim());
+        return h;
+    }
+
+    public static bool IsHidden(AgentKind k) { return HiddenSet().Contains(k.Id); }
+
+    public static void SetHidden(AgentKind k, bool hide)
+    {
+        HashSet<string> h = HiddenSet();
+        if (hide) h.Add(k.Id); else h.Remove(k.Id);
+        Prefs.SetStr("roster.hidden", string.Join(",", h));
+    }
+
+    // ---- 卸载软件：找这家自己的卸载程序 ----
+
+    // 返回 (显示用的名字, 命令行)；找不到返回 null。商店版不在这里（让用户去系统设置里卸）。
+    // 先翻注册表的卸载项（显示名等于名字、或者装在程序所在目录），再找 Squirrel 那种程序旁边的「Uninstall X.exe」
+    public static string[] Uninstaller(AgentKind k)
+    {
+        if (!string.IsNullOrEmpty(k.AppsFolder)) return null;
+        string exe = DesktopExe(k);
+        string exeDir = exe == null ? null : Path.GetDirectoryName(exe);
+        var names = new List<string> { k.Name };
+        if (k.Processes != null) names.AddRange(k.Processes);
+        foreach (var hive in new[] { Microsoft.Win32.Registry.CurrentUser, Microsoft.Win32.Registry.LocalMachine })
+            foreach (string sub in new[] { @"Software\Microsoft\Windows\CurrentVersion\Uninstall", @"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" })
+            {
+                try
+                {
+                    using (var root = hive.OpenSubKey(sub))
+                    {
+                        if (root == null) continue;
+                        foreach (string id in root.GetSubKeyNames())
+                            using (var key = root.OpenSubKey(id))
+                            {
+                                string dn = key?.GetValue("DisplayName") as string;
+                                string cmd = key?.GetValue("UninstallString") as string;
+                                if (string.IsNullOrEmpty(dn) || string.IsNullOrEmpty(cmd)) continue;
+                                string loc = key.GetValue("InstallLocation") as string;
+                                bool byName = names.Exists(n => string.Equals(dn.Trim(), n, StringComparison.OrdinalIgnoreCase));
+                                bool byDir = exeDir != null && !string.IsNullOrEmpty(loc)
+                                    && exeDir.StartsWith(loc.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+                                if (byName || byDir) return new[] { dn, cmd };
+                            }
+                    }
+                }
+                catch { }
+            }
+        if (exeDir != null)
+            try
+            {
+                foreach (string f in Directory.GetFiles(exeDir, "Uninstall*.exe"))
+                    return new[] { k.Name, "\"" + f + "\"" };
+            }
+            catch { }
+        return null;
     }
 
     // 只删自定义的；预设的删不掉（最多用同 id 覆盖）

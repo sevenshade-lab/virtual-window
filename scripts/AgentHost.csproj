@@ -47,6 +47,16 @@
     <!-- 钩子小程序嵌进 exe，装钩子时释放到 LOCALAPPDATA 下的 AgentHost/bin（见 HookSetup） -->
     <EmbeddedResource Include="hooks/agenthost-hook.cjs" LogicalName="agenthost-hook.cjs" />
     <EmbeddedResource Include="hooks/agenthost-opencode.js" LogicalName="agenthost-opencode.js" />
+    <!-- 留言的存取和命令行：跟钩子小程序释放到同一个目录，钩子按相对路径找它 -->
+    <EmbeddedResource Include="hooks/agenthost-notes.cjs" LogicalName="agenthost-notes.cjs" />
+    <EmbeddedResource Include="hooks/agenthost-tasks.cjs" LogicalName="agenthost-tasks.cjs" />
+    <!-- 等回音：派出去的活有了回音，叫醒派活的那个 Claude 会话 -->
+    <EmbeddedResource Include="hooks/agenthost-wake.cjs" LogicalName="agenthost-wake.cjs" />
+    <!-- 订阅额度：宿主自己放出去、定时跑（见 HostForm.Quota.cs），不归「重新安装钩子」管 -->
+    <EmbeddedResource Include="hooks/agenthost-quota.cjs" LogicalName="agenthost-quota.cjs" />
+    <!-- 长对话提醒 + 待办：宿主自己放出去（见 HostForm.Todo.cs）；钩子和 OpenCode 插件按同一个目录找它们 -->
+    <EmbeddedResource Include="hooks/agenthost-hygiene.cjs" LogicalName="agenthost-hygiene.cjs" />
+    <EmbeddedResource Include="hooks/agenthost-todo.cjs" LogicalName="agenthost-todo.cjs" />
   </ItemGroup>
 
 </Project>

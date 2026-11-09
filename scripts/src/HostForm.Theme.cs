@@ -59,11 +59,11 @@ internal sealed partial class HostForm
         menu.Closed += delegate
         {
             _menuOpen = false;
-            if (giveBack != IntPtr.Zero && Native.IsWindow(giveBack) && SlotWithHwnd(giveBack) != null)
-                BeginInvoke((MethodInvoker)delegate { if (!_menuOpen) GiveFocus(giveBack, true); });
+            GiveBackAfterPopup(giveBack);
         };
         AddThemeItems(menu.Items);
         ShellStyles.Menu(menu, Font, _scale);
+        TrackMenu(menu);
         menu.Show(_themeBtn, new Point(0, _themeBtn.Height));
     }
 

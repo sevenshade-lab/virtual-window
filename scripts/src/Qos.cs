@@ -126,6 +126,8 @@ internal static class Qos
             if (pid != 0) roots.Add((int)pid);
         }
         var want = new HashSet<int>(roots);
+        // 顺带把每格整棵进程树的内存算一遍（MemStats），悬停提示用；跟下面一样只在这条后台线程上扫
+        try { MemStats.Sample(roots); } catch { }
         if (roots.Count > 0)
         {
             IntPtr snap = CreateToolhelp32Snapshot(0x2 /* TH32CS_SNAPPROCESS */, 0);

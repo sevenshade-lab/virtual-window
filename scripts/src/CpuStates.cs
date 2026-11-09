@@ -125,7 +125,7 @@ internal static class CpuStates
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr h, out long create, out long exit, out long kernel, out long user);
 
-    static Dictionary<int, List<int>> ChildrenMap()
+    internal static Dictionary<int, List<int>> ChildrenMap()
     {
         var map = new Dictionary<int, List<int>>();
         IntPtr snap = CreateToolhelp32Snapshot(0x2 /* TH32CS_SNAPPROCESS */, 0);

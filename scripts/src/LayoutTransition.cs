@@ -37,6 +37,8 @@ internal sealed class LayoutTransition : Form
     const int FadeMs = 160;
     const int TurnMs = 380;        // Turn：一页翻过去多久
     const int TurnBaseFadeMs = 120;   // Turn：页以外的地方（侧栏、页边、索引签）从旧画面淡到新画面多久
+    const int RegrabMs = 70;          // Turn：翻页期间每隔多久在后台重截一次底下的新画面（一次二三十毫秒）
+    const float RegrabFrom = 0.3f;    // Turn：翻过这么多才开始重截（刚开翻时露出来的还少）
     const int WS_EX_LAYERED = 0x00080000;
     const int WS_EX_TRANSPARENT = 0x00000020;
     const int WS_EX_NOACTIVATE = 0x08000000;
@@ -134,7 +136,9 @@ internal sealed class LayoutTransition : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        Gdi.SetLayeredWindowAttributes(Handle, 0, 255, Gdi.LWA_ALPHA);
+        // 先全透明：窗口显示出来到第一次画上底板之间，DWM 可能先合成一帧没画过的面（用户 2026-10-21：
+        // 「切换 agent 时这一片区域白一下」）。画好、等一次合成之后再变不透明（Unveil）。
+        Gdi.SetLayeredWindowAttributes(Handle, 0, 0, Gdi.LWA_ALPHA);
         // 关掉系统给新窗口的「打开」动画（从略小、半透明缩放淡入约 100ms）：
         // 浮层画的是原画面，可那 100ms 里它跟底下对不齐，看着就是点一下先闪一下。
         int on = 1;
@@ -142,7 +146,28 @@ internal sealed class LayoutTransition : Form
         // 让截屏跳过浮层（人眼照样看得见）：第二张就能用快的屏幕截图，截到的一定是底下的新排版。
         // PrintWindow 要把整个宿主重画一遍，实测 150~300ms，第二段会晚开播、中间停在空底板上。
         // 慢放调试时不设，好让截图工具看得见浮层；那时第二张退回 PrintWindow。
-        _hiddenFromCapture = _slow == 1 && Gdi.SetWindowDisplayAffinity(Handle, Gdi.WDA_EXCLUDEFROMCAPTURE);
+        _hiddenFromCapture = _slow == 1 && !CaptureVisible() && Gdi.SetWindowDisplayAffinity(Handle, Gdi.WDA_EXCLUDEFROMCAPTURE);
+    }
+
+    // 画好底板之后调：等 DWM 把它合成一次，再把浮层变成不透明，再等一次合成（这时屏幕上就是浮层了）。
+    // 不等就回去换排版，会先露出一眼新排版、浮层才盖上来（用户看到的「先闪一下」）。
+    void Unveil()
+    {
+        Gdi.DwmFlush();
+        Gdi.SetLayeredWindowAttributes(Handle, 0, 255, Gdi.LWA_ALPHA);
+        Gdi.DwmFlush();
+    }
+
+    // 诊断用：有 %LOCALAPPDATA%\AgentHost\anim-capture.txt 时浮层不对录屏隐身，好用 ffmpeg ddagrab 录下用户眼里的画面逐帧看；
+    // 那时第二张退回 PrintWindow（慢，150~300ms），动画会晚开播，只在查闪烁时放这个文件
+    static bool CaptureVisible()
+    {
+        try
+        {
+            string p = System.IO.Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA") ?? "", "AgentHost", "anim-capture.txt");
+            return System.IO.File.Exists(p);
+        }
+        catch { return false; }
     }
 
     protected override void WndProc(ref Message m)
@@ -205,8 +230,7 @@ internal sealed class LayoutTransition : Form
             f.Show(host);
             f.Update();
             long tShow = sw.ElapsedMilliseconds;
-            Gdi.DwmFlush();
-            Gdi.DwmFlush();
+            f.Unveil();
             Log.W(string.Format("layout-anim cover(fast): shot {0}ms, show {1}ms, flush {2}ms", tShot, tShow - tShot, sw.ElapsedMilliseconds - tShow));
             return f;
         }
@@ -248,10 +272,7 @@ internal sealed class LayoutTransition : Form
             f.Show(host);
             f.Update();
             long tShow = sw.ElapsedMilliseconds;
-            // 窗口画好了不等于上了屏：要等 DWM 下一次合成。不等就回去换排版，
-            // 会先露出一眼新排版、浮层才盖上来（用户看到的「先闪一下」）。
-            Gdi.DwmFlush();
-            Gdi.DwmFlush();
+            f.Unveil();
             Log.W(string.Format("layout-anim cover: shot {0}ms, cut {1}ms, show {2}ms, flush {3}ms", tShot, tFrame - tShot, tShow - tFrame, sw.ElapsedMilliseconds - tShow));
             return f;
         }
@@ -545,27 +566,62 @@ internal sealed class LayoutTransition : Form
             if (next != null && !_stop)
             {
                 end = "turned";
-                // 这一段每帧都整张重画（浮层一直不透明），画完的最后一帧就是底下的新画面，揭开不跳
+                // 这一段每帧都整张重画（浮层一直不透明），画完的最后一帧就是底下的新画面，揭开不跳。
+                // 只是底下那家翻页期间还在变：切过去之后才补发激活（焦点样式、光标）、正在输出的字在滚 ——
+                // 开播前截的那张到揭开时已经是半秒前的，最后一帧跟真窗口对不上，揭开那一下就跳（用户 2026-10-21：
+                // 「切换 agent 的时候最容易闪」）。所以翻过 RegrabFrom 之后每隔 RegrabMs 在后台重截一张换上，
+                // 揭开前再截最后一张：最后一帧跟真窗口最多差一次截图的工夫（二三十毫秒）。
+                int regrabs = 0;
                 using (GdiImage rise = GdiImage.Ramp(true))
                 using (GdiImage fall = GdiImage.Ramp(false))
                 {
                     int t0 = (int)(clock.ElapsedMilliseconds / slow);
                     last = -1;
-                    while (!_stop)
+                    Task<GdiImage> regrab = null;
+                    int grabbedAt = 0;
+                    try
                     {
-                        int t = (int)(clock.ElapsedMilliseconds / slow) - t0;
-                        float u = Clamp(t / (float)TurnMs);
-                        long p0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                        DrawTurn(buf, _old.Plate, next, rise, fall, _turn, u, Clamp(t / (float)TurnBaseFadeMs));
-                        Gdi.BitBlt(wdc, 0, 0, size.Width, size.Height, buf, 0, 0, Gdi.SRCCOPY);
-                        paintMs += (System.Diagnostics.Stopwatch.GetTimestamp() - p0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                        if (last >= 0) { maxGap = Math.Max(maxGap, t - last); if (t - last > 25) gaps.Append(' ').Append(last).Append('+').Append(t - last); }
-                        last = t;
-                        frames++;
-                        if (u >= 1f) break;
-                        if (Gdi.DwmFlush() != 0) Thread.Sleep(8);
+                        while (!_stop)
+                        {
+                            int t = (int)(clock.ElapsedMilliseconds / slow) - t0;
+                            float u = Clamp(t / (float)TurnMs);
+                            if (u >= 1f && regrab == null && t - grabbedAt > RegrabMs / 2)
+                            {
+                                // 最后一帧：现截一张（后台那张要是刚截完就用它，不再截）
+                                grabbedAt = t;
+                                regrab = Task.FromResult(GrabNext());
+                            }
+                            if (regrab != null && (regrab.IsCompleted || u >= 1f))
+                            {
+                                GdiImage g = null;
+                                try { g = regrab.Result; } catch { }
+                                regrab = null;
+                                if (g != null) { next.Dispose(); next = g; regrabs++; }
+                            }
+                            else if (regrab == null && u >= RegrabFrom && t - grabbedAt >= RegrabMs)
+                            {
+                                grabbedAt = t;
+                                regrab = Task.Run((Func<GdiImage>)GrabNext);
+                            }
+                            long p0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                            DrawTurn(buf, _old.Plate, next, rise, fall, _turn, u, Clamp(t / (float)TurnBaseFadeMs));
+                            Gdi.BitBlt(wdc, 0, 0, size.Width, size.Height, buf, 0, 0, Gdi.SRCCOPY);
+                            paintMs += (System.Diagnostics.Stopwatch.GetTimestamp() - p0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                            if (last >= 0) { maxGap = Math.Max(maxGap, t - last); if (t - last > 25) gaps.Append(' ').Append(last).Append('+').Append(t - last); }
+                            last = t;
+                            frames++;
+                            if (u >= 1f) break;
+                            if (Gdi.DwmFlush() != 0) Thread.Sleep(8);
+                        }
+                    }
+                    finally
+                    {
+                        // 被连点收掉时后台可能还在截：截完自己释放
+                        if (regrab != null)
+                            regrab.ContinueWith(tk => { if (tk.Status == TaskStatus.RanToCompletion && tk.Result != null) tk.Result.Dispose(); });
                     }
                 }
+                end = "turned (regrab x" + regrabs + ")";
             }
             while (!_stop && _morph && !_fadeOnly)
             {

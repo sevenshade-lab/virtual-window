@@ -58,6 +58,7 @@ internal sealed partial class HostForm
         L.Load();
         SyncLangButton();
         ReapplyTips();
+        SyncQuotaTip();   // 额度那条的提示是拼出来的整句，不在 _tipText 的查表里，重拼一遍
         RefitLabels(this);
         Relayout(false);   // 工具栏按钮、侧栏名字的宽度都按新文字重排
         Invalidate(true);

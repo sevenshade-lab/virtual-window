@@ -14,7 +14,7 @@ internal sealed partial class HostForm : Form
     //（2026-10-12 之前工具条也是一张悬浮的胶囊卡片）。
     // 所有尺寸按 96dpi 写，D() 换成当前屏幕的像素（宿主是 per-monitor DPI aware）。
     float _scale = 1f;
-    int D(int v) { return (int)Math.Round(v * _scale); }
+    internal int D(int v) { return (int)Math.Round(v * _scale); }
     Rectangle _pill;
     // _pill：工具条上字和按钮占的那一块。_toolbarH：工具条的下边，格子从这儿再隔一道间隔排起。都在 LayoutToolbar 里定
     int _toolbarH;
@@ -36,6 +36,7 @@ internal sealed partial class HostForm : Form
     readonly GlassButton _view;
     readonly GlassButton _launch;
     readonly GlassButton _settings;
+    readonly GlassButton _roster;
     DateTime _lockUntil = DateTime.MinValue;
     bool _placing;
     int _layoutIx;
@@ -104,10 +105,17 @@ internal sealed partial class HostForm : Form
         _launch = MkBtn("＋ 新会话", 370, 8, 96, 32);
         _launch.Primary = true;
         // 「设置」：以前挤在「启动 ▾」菜单里的纳入别的窗口、方案、偏好、日志
+        // 「Agent 列表」：以前在「设置」底下，要两下才到（用户 2026-10-24 要求独立出来）
+        _roster = MkBtn("Agent 名单", 470, 8, 90, 32);
+        _roster.Click += delegate { ShowRoster(); };
+        _roster.Primary = true;   // 「＋ 新会话」拿掉之后由它带强调色（用户 2026-10-27）
+        Controls.Add(_roster);
+        CreateTodoButton();   // 「待办」：各家对话里没做完的事（HostForm.Todo.cs）
         _settings = MkBtn("设置", 470, 8, 56, 32);
         _settings.Click += ShowSettings;
         Controls.Add(_settings);
         CreateThemeButton();
+        CreateQuotaStrip();
 
         _minBtn = MkCap("", delegate { WindowState = FormWindowState.Minimized; });
         _maxBtn = MkCap("", delegate
@@ -137,7 +145,8 @@ internal sealed partial class HostForm : Form
         Tip(_arrange, "按当前这套排版，把窗口重新贴一遍");
         Tip(_cycle, "换下一套排版（同样格子数下轮换）");
         Tip(_launch, "开一家的桌面端，或者在某个文件夹里开它的终端");
-        Tip(_settings, "外观、偏好、状态灯钩子、名单、添加窗口、组合、日志");
+        Tip(_settings, "外观、偏好、状态灯钩子、委托、添加窗口、组合、日志");
+        Tip(_roster, "启动、添加、删除 agent，装钩子、卸载软件");
         Tip(_minBtn, "最小化（格子里的窗口跟着收起）");
         CreateLangButton();
         SyncViewButton();

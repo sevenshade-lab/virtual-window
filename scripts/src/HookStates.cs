@@ -55,7 +55,9 @@ internal static class HookStates
                         At = r.TryGetProperty("at", out JsonElement at) && at.TryGetInt64(out long v) ? v : 0,
                         Mtime = m,
                         Note = new HookNote { Event = Str(r, "event"), Tool = Str(r, "tool"), Reply = Str(r, "reply"), Cwd = Str(r, "cwd"),
-                                              Session = Str(r, "sessionId"), Review = Str(r, "review") }
+                                              Session = Str(r, "sessionId"), Review = Str(r, "review"),
+                                              Ctx = r.TryGetProperty("ctx", out JsonElement cx) && cx.TryGetInt64(out long cv) ? cv : 0,
+                                              CtxApprox = r.TryGetProperty("ctxApprox", out JsonElement ca) && ca.ValueKind == JsonValueKind.True }
                     };
                 }
             }
@@ -161,6 +163,9 @@ internal sealed class HookNote
     public string Event, Tool, Reply, Cwd;
     // 是哪个会话的记录；Codex 的请求批准归谁批（钩子查到了才有）。只进日志：查「灯怎么变的」用
     public string Session, Review;
+    // 上下文多长（tokens，钩子在一轮开头 / 结尾量的，见 agenthost-hygiene.cjs）；0 = 没量到。CtxApprox：按字数估的（Cursor）
+    public long Ctx;
+    public bool CtxApprox;
 
     // 日志里「状态为什么变」那一小段：事件名、工具名、会话号的头 8 位。不带正文
     public static string Why(HookNote n)

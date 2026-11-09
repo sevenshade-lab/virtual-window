@@ -12,6 +12,8 @@ internal sealed partial class HostForm
     bool _loadingSlots;
     bool _restoreOnFirstClaim;
     readonly Dictionary<string, DateTime> _launching = new Dictionary<string, DateTime>();
+    readonly Dictionary<string, DateTime> _launchedAt = new Dictionary<string, DateTime>();   // 真拉起的那一刻（等更新那段不算）
+    readonly HashSet<string> _launchChecking = new HashSet<string>();
     Slot _dragSlot, _dragTarget;
     Point _dragStart;
     bool _dragging;
@@ -241,6 +243,7 @@ internal sealed partial class HostForm
         s.DropBtn.Click += delegate { Drop(captured); };
         s.ZoomBtn = MkChip();
         s.ZoomBtn.Click += delegate { ToggleZoom(s); };
+        s.StateLbl.SizeChanged += delegate { if (!_placing && _slots.Contains(s) && s.DropBtn.Visible) PlaceChips(s); };
         s.TitleLbl.DoubleClick += delegate { ToggleZoom(s); };
         s.StateLbl.DoubleClick += delegate { ToggleZoom(s); };
         s.Site.Controls.Add(s.LaunchBtn);
@@ -300,7 +303,28 @@ internal sealed partial class HostForm
             s.StateLbl.Text = "移出失败";
             return;
         }
+        int at = _slots.IndexOf(s);
         RemoveSlot(s);
+        Relayout(true);
+        // 「移出」不好撤（窗口飘到桌面上，要再「纳入」、位置也变了），又挨着别的按钮容易误点：
+        // 不弹确认框，在状态那一行留一句能点的话，几秒内点一下原样放回原来的位置（用户 2026-10-15）
+        if (h != IntPtr.Zero && Native.IsWindow(h))
+            ToastAct(L.F("已把 {0} 移出成独立窗口 · 点这里放回", k.Name), delegate { UndoDrop(k, h, at); }, 8);
+    }
+
+    void UndoDrop(AgentKind k, IntPtr h, int at)
+    {
+        _toast = null; _toastAction = null; Invalidate(_pill);
+        if (_closed || !Native.IsWindow(h) || !Embed.IsTopLevel(h) || SlotOf(k) != null) return;
+        Slot s = AddSlot(k);
+        if (s == null) return;
+        _slots.Remove(s);
+        _slots.Insert(Math.Max(0, Math.Min(at, _slots.Count)), s);
+        s.Hwnd = h;
+        _launching.Remove(k.Id);
+        SaveSlots();
+        Log.W("drop " + k.Id + ": 点了提示，放回格子");
+        if (_queueMode) PinFront(s);
         Relayout(true);
     }
 
@@ -338,13 +362,94 @@ internal sealed partial class HostForm
             return;
         }
         Relayout(false);
+        if (k.Cli) { LaunchNow(s, k); return; }
+        // 桌面端：先看它自己的更新安装程序在不在跑（见 Updaters），在跑就等它装完再拉起。
+        // 扫全机进程放后台线程；等的这段也算「正在启动」，免得再点一下又起一个
+        _launching[k.Id] = DateTime.Now.AddSeconds(UpdaterWaitSecs + 30);
+        s.StateLbl.Text = "正在启动…";
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
+        {
+            string upd = null;
+            try { upd = Updaters.Running(k); } catch { }
+            if (upd != null)
+            {
+                Log.W("launch: " + k.Name + " 的更新安装程序在跑（" + upd + "），等它装完再启动");
+                UiPost(delegate { if (_slots.Contains(s) && s.Hwnd == IntPtr.Zero) s.StateLbl.Text = "在更新，装完再启动…"; });
+                DateTime t0 = DateTime.Now;
+                while (upd != null && (DateTime.Now - t0).TotalSeconds < UpdaterWaitSecs && !_closed)
+                {
+                    System.Threading.Thread.Sleep(2000);
+                    try { upd = Updaters.Running(k); } catch { upd = null; }
+                }
+                int waited = (int)(DateTime.Now - t0).TotalSeconds;
+                Log.W(upd == null
+                    ? "launch: " + k.Name + " 更新装完了（等了 " + waited + " 秒）"
+                    : "launch: " + k.Name + " 的更新等满 " + waited + " 秒还在跑，照样启动");
+                // 带 --force-run 的安装程序装完会自己把它拉起来，给它几秒出窗口，出来了下面就直接嵌
+                if (upd == null) System.Threading.Thread.Sleep(4000);
+            }
+            UiPost(delegate
+            {
+                if (_closed) return;
+                if (!_slots.Contains(s)) { _launching.Remove(k.Id); return; }   // 等的时候格子被移出了：别挡着下次再加
+                if (s.Hwnd != IntPtr.Zero && Native.IsWindow(s.Hwnd)) return;   // 等的时候心跳已经嵌上了
+                WinInfo got = HostWins.Find(k, UnusedWindows(HostWins.Visible()));
+                if (got != null) { s.Hwnd = got.Handle; _launching.Remove(k.Id); Relayout(true); return; }
+                LaunchNow(s, k);
+            });
+        });
+    }
+
+    // 拉起后到点了窗口还没出来。桌面端先看进程在不在：在的话多给到 60 秒，还没窗口就写明「开了没窗口」——
+    // 10-14 那次就是这样（更新没装完被拉起，进程在、主窗口一直不出来），以前只写「没打开」，看不出是怎么回事
+    void LaunchOverdue(Slot s)
+    {
+        AgentKind k = s.Kind;
+        if (k.Cli) { s.StateLbl.Text = "启动未完成，可重试"; s.StateLbl.DotOnly = false; return; }
+        if (!_launchChecking.Add(k.Id)) return;
+        DateTime at = _launchedAt.ContainsKey(k.Id) ? _launchedAt[k.Id] : DateTime.Now;
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
+        {
+            bool alive = false;
+            try { alive = Updaters.AppAlive(k); } catch { }
+            UiPost(delegate
+            {
+                _launchChecking.Remove(k.Id);
+                if (!_slots.Contains(s) || s.Hwnd != IntPtr.Zero || s.StateLbl.Text != "正在启动…") return;
+                if (alive && (DateTime.Now - at).TotalSeconds < LaunchNoWindowSecs)
+                {
+                    _launching[k.Id] = at.AddSeconds(LaunchNoWindowSecs);
+                    return;
+                }
+                s.StateLbl.Text = alive ? "开了没窗口，可能在更新" : "启动未完成，可重试";
+                s.StateLbl.DotOnly = false;
+                if (alive) Log.W("launch: " + k.Name + " 拉起 " + (int)(DateTime.Now - at).TotalSeconds + " 秒了，进程在、没有窗口（可能在更新）");
+                SyncStateLabel(s);
+            });
+        });
+    }
+
+    const int LaunchNoWindowSecs = 60;
+
+    // 等更新安装程序最多多久。到了还在跑就照样启动（总比一直不启动强）
+    const int UpdaterWaitSecs = 120;
+
+    void UiPost(Action a)
+    {
+        try { if (!_closed && IsHandleCreated) BeginInvoke(a); } catch { }
+    }
+
+    void LaunchNow(Slot s, AgentKind k)
+    {
         if (!Launch.Start(k))
         {
+            _launching.Remove(k.Id);
             s.StateLbl.Text = "没找到启动入口";
             Toast(Launch.LastWhy ?? L.F("没找到 {0} 的启动入口", k.Name));
             return;
         }
         _launching[k.Id] = DateTime.Now.AddSeconds(30);
+        _launchedAt[k.Id] = DateTime.Now;
         s.StateLbl.Text = "正在启动…";
         _lockUntil = DateTime.Now.AddSeconds(k.Id == "claude" || k.Id == "codex" ? 25 : 15);
     }
@@ -460,8 +565,10 @@ internal sealed partial class HostForm
     void Relayout(bool place)
     {
         if (_placing) return;
+        SyncFullscreen();
         LayoutToolbar();
-        Rectangle box = new Rectangle(0, ToolbarH, ClientSize.Width, Math.Max(80, ClientSize.Height - ToolbarH));
+        int top = ToolbarH + TodoStripH;   // 待办条带在工具条和格子之间（没待办时 0）
+        Rectangle box = new Rectangle(0, top, ClientSize.Width, Math.Max(80, ClientSize.Height - top));
         int n = _slots.Count;
         LayoutStartCards(box, n == 0);
 

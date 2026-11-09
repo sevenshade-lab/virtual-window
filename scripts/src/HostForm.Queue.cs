@@ -123,7 +123,9 @@ internal sealed partial class HostForm
         if (askers.Count > 0 && !_manualPin && (_sticky == null || _sticky.AgentState != "asking")) _sticky = askers[0];
         else if (_sticky == null || Busy(_sticky))
         {
-            Slot news = fresh.Find(NewNews);
+            // 靠 CPU 猜状态的格子不顶上来：静 10 秒就算「做完」，一个长任务里来回跳，
+            // 每跳一次就把你从别家拽走（2026-10-14 用户：「老是自动跳转到 Grok Bot」，它没有钩子）。灯照亮，排在队里等你点。
+            Slot news = fresh.Find(x => NewNews(x) && !UsesCpu(x));
             if (news != null) _sticky = news;
             else if (_sticky == null) _sticky = StartFront();
         }
@@ -236,7 +238,8 @@ internal sealed partial class HostForm
             foreach (Slot s in busy) { chips[s] = new Rectangle(x, y, ChipH, ChipH); y += ChipH + D(8); }
         // 放大时左边整个收起，只剩中间那张
         if (zoomed) { chips.Clear(); _railDivider = Rectangle.Empty; }
-        if (_railHot != null && !chips.ContainsKey(_railHot) && !_pages.Contains(_railHot)) _railHot = null;
+        // 停着的那一家不再是签了：连浅底、提示、光标一起清（排完版 SyncRailHot 再照鼠标现在的位置认一次）
+        if (_railHot != null && !chips.ContainsKey(_railHot) && !_pages.Contains(_railHot)) SetRailHot(null);
 
         _queueEmpty = front == null ? fr : Rectangle.Empty;
         _peekRects.Clear();
@@ -259,6 +262,7 @@ internal sealed partial class HostForm
             else { s.Pane = Rectangle.Empty; HideChrome(s); continue; }
             PlaceChip(s);
         }
+        SyncRailHot();
         Invalidate();
         if (place) PlaceAll();
         SyncStack();
@@ -275,6 +279,7 @@ internal sealed partial class HostForm
         _book = null;
         _leftSlots.Clear();
         _leftTabs = NoTabs;
+        SetRailHot(null);
     }
 
     // 索引签上写的那一小句（只有嵌好了、状态是钩子报上来的才有）。两行的中间是 \n
@@ -404,19 +409,49 @@ internal sealed partial class HostForm
     // 鼠标在宿主上移动：停在侧栏方块、索引签或者露出来的页边上，就画浅底、出名字
     void RailHover(object sender, System.Windows.Forms.MouseEventArgs e)
     {
-        Slot hot = null;
-        if (_queueMode && !_queueZoom)
+        SetRailHot(RailHit(e.Location));
+    }
+
+    // 这一点落在哪一家的小卡片 / 哪一页上（点了会把它拉到中间的那些地方）。都不是返回 null
+    Slot RailHit(Point p)
+    {
+        if (!_queueMode || _queueZoom) return null;
+        foreach (Slot s in _slots)
+            if (s != QueueFront && s.Pane.Width > 0 && s.Pane.Contains(p)) return s;
+        return PageAt(p);
+    }
+
+    void SetRailHot(Slot hot)
+    {
+        if (hot != _railHot)
         {
-            foreach (Slot s in _slots)
-                if (s != QueueFront && s.Pane.Width > 0 && s.Pane.Contains(e.Location)) { hot = s; break; }
-            if (hot == null) hot = PageAt(e.Location);
+            InvalidateChip(_railHot);
+            _railHot = hot;
+            InvalidateChip(hot);
+            _tips.SetToolTip(this, hot != null ? RailTip(hot) : null);
         }
-        if (hot == _railHot) return;
-        InvalidateChip(_railHot);
-        _railHot = hot;
-        InvalidateChip(hot);
-        Cursor = hot != null ? System.Windows.Forms.Cursors.Hand : System.Windows.Forms.Cursors.Default;
-        _tips.SetToolTip(this, hot != null ? RailTip(hot) : null);
+        // 光标每次都照「现在停在谁上面」对一遍，不只在换了一家时才改：记着的那一家会被排版清掉（见 SyncRailHot），
+        // 那时光标要是还留着手型，之后鼠标在空地方怎么动认出来的都是「没有」、跟记着的一样，就再也改不回来。
+        // 只管手型和箭头之间的事：拖动换位时的十字（SlotDragMove）不归这里管。
+        if (hot != null) { if (Cursor != System.Windows.Forms.Cursors.Hand) Cursor = System.Windows.Forms.Cursors.Hand; }
+        else if (Cursor == System.Windows.Forms.Cursors.Hand) Cursor = System.Windows.Forms.Cursors.Default;
+    }
+
+    // 排版变了（点签翻了页、有人做完了挪了位置、放大、换视图），鼠标没动，它底下却可能换了东西：照它现在的位置重新认一次。
+    // 以前排版时只把记着的那一家清掉，光标还是手型 —— 点完一个签，鼠标挪到两边没有签的空地方，一直是手型，
+    // 看着能点、点了没反应（用户 2026-10-12 报）。
+    void SyncRailHot()
+    {
+        Slot hot = null;
+        try
+        {
+            Native.POINT sp;
+            // 鼠标正在宿主自己身上才认（在客户端、按钮这些子窗口上，或者被过渡动画的浮层盖着，都不算）
+            if (IsHandleCreated && Native.GetCursorPos(out sp) && Native.WindowFromPoint(sp) == Handle)
+                hot = RailHit(PointToClient(new Point(sp.X, sp.Y)));
+        }
+        catch { }
+        SetRailHot(hot);
     }
 
     // 悬停变了要重画哪儿。连子控件一起（灯是压在小卡片上的子控件，底是它借父窗口画的：
@@ -470,7 +505,7 @@ internal sealed partial class HostForm
     {
         LayoutTransition tr = null;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        Rectangle area = new Rectangle(0, ToolbarH, ClientSize.Width, Math.Max(0, ClientSize.Height - ToolbarH));
+        Rectangle area = new Rectangle(0, ToolbarH + TodoStripH, ClientSize.Width, Math.Max(0, ClientSize.Height - ToolbarH - TodoStripH));
         if (_slots.Count > 0)
         {
             if (_transition != null && !_transition.IsDisposed) _transition.Close();
@@ -630,12 +665,22 @@ internal sealed partial class HostForm
             return;
         }
         _queuePending = false;
-        RunTransition(delegate
+        Action apply = delegate
         {
             _waitQ.Clear(); _waitQ.AddRange(newQ); _sticky = newSticky;
             _queueSig = "";
             Relayout(true);
-        }, true, true);
+        };
+        // 中间那张没换人：只是左右的签多了 / 少了 / 挪了，中间那张的位置不跟着变（QueueFrontRect），客户端也不动。
+        // 这时直接重排，不盖整窗截图再淡出 —— 以前别家灯一变就整窗淡一次，2026-10-18 量过 2.5 小时 143 次里 129 次
+        // 中间那张根本没换（一半是 Grok Bot 靠 CPU 猜、十来秒跳一次），用户说「频繁闪屏」。
+        if (newFront == curFront)
+        {
+            Log.W("queue reshuffle, front unchanged (" + (curFront == null ? "-" : curFront.Kind.Id) + "), no fade");
+            apply();
+            return;
+        }
+        RunTransition(apply, true, true);
     }
 
     // 画卡片的顺序：网格视图就是格子顺序；队列视图中间那张最后画，压住它后面那几页的左边。

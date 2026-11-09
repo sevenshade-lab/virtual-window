@@ -105,29 +105,18 @@ internal sealed partial class HostForm
 
     void FocusUnderCursor()
     {
-        Native.POINT p;
-        if (!Native.GetCursorPos(out p)) return;
-        IntPtr under = Native.WindowFromPoint(p);
-        if (under == IntPtr.Zero) return;
-        for (int i = 0; i < _slots.Count; i++)
-        {
-            Slot s = _slots[i];
-            if (s.Hwnd == IntPtr.Zero || !s.Embedded) continue;
-            if (under == s.Hwnd || IsDescendant(under, s.Hwnd))
-            {
-                // 「看过」只算真人点进来：开机自动交焦点、换排版时补焦点都不算，
-                // 否则重启一次所有黄灯就全灭了。
-                Seen.Touch(s.Kind.Id);
-                s.DoneUnseen = false;
-                RefreshAgentIndicator(s);
-                _focusByUser = true;
-                GiveFocus(s.Hwnd);
-                return;
-            }
-        }
+        Slot s = SlotUnderCursor();
+        if (s == null) return;
+        // 「看过」只算真人点进来：开机自动交焦点、换排版时补焦点都不算，
+        // 否则重启一次所有黄灯就全灭了。
+        Seen.Touch(s.Kind.Id);
+        s.DoneUnseen = false;
+        RefreshAgentIndicator(s);
+        _focusByUser = true;
+        GiveFocus(s.Hwnd);
     }
 
-    // 嵌进来的桌面端右上角那三个钮（– □ ✕）：Electron 在网页层自己画的（问它 WM_NCHITTEST 回的是 HTCLIENT），
+    // 嵌进来的桌面端右上角那几个钮（– □ ✕，多数只剩 ✕）：Electron 自己画的，
     // 嵌成子窗口后时灵时不灵 —— 2026-09-26 实测点 ✕ 一次收进托盘、一次毫无反应。按位置由宿主接管：
     //   ✕ = 发 WM_CLOSE（它收进托盘 → 心跳「待关」20 秒后收掉进程，跟单独开时点 ✕ 退出一样）
     //   □ = 宿主最大化 / 还原；– = 宿主最小化（让子窗口自己最小化只会缩成格子里一个小方块）。
@@ -142,13 +131,8 @@ internal sealed partial class HostForm
         {
             if (s.Hwnd == IntPtr.Zero || !s.Embedded || s.Kind.Cli || s.Custom) continue;
             if (under != s.Hwnd && !IsDescendant(under, s.Hwnd)) continue;
-            Native.RECT r;
-            if (!Native.GetWindowRect(s.Hwnd, out r)) return false;
-            // 高 30：标准标题栏按钮的高度。设成 40 会盖到 Codex 标题栏下面那排工具钮（分享、面板切换，
-            // 上沿约 32）的上半截 —— 点它们会被当成 – □ ✕
-            int bw = (int)Math.Round(46 * _scale), bh = (int)Math.Round(30 * _scale);
-            if (p.Y < r.Top || p.Y >= r.Top + bh || p.X < r.Right - 3 * bw || p.X >= r.Right) return false;
-            int k = (r.Right - 1 - p.X) / bw;   // 0=✕ 1=□ 2=–
+            int k = CaptionButtonAt(s.Hwnd, p);
+            if (k < 0) return false;
             if (k == 0)
             {
                 Log.W("caption " + s.Kind.Id + ": 点了 ✕，替它发关闭");
@@ -168,6 +152,31 @@ internal sealed partial class HostForm
             return true;
         }
         return false;
+    }
+
+    // 点在它哪个标题栏按钮上：0=✕ 1=□ 2=–，不在按钮上 -1。问它自己（WM_NCHITTEST），不按位置猜：
+    // 以前一律当右上角从右往左是 ✕ □ –、每个 46 宽，可嵌进来去掉 MINIMIZEBOX/MAXIMIZEBOX 之后
+    // Claude、Antigravity、Grok Bot、OpenCode 只剩一个 ✕（2026-10-15 实测，只有 Codex 自己画了三个），
+    // 紧挨着 ✕ 的是它们自己的工具钮 —— Claude 的 ⋮ 被当成 □ 把宿主从最大化还原（用户：点完窗口弹出来），
+    // 「文件」被当成 – 把宿主最小化。它卡着（20ms 没回）就当不在按钮上，点击原样交给它。
+    internal static int CaptionButtonAt(IntPtr hwnd, Native.POINT p)
+    {
+        IntPtr ht;
+        IntPtr lp = (IntPtr)(((p.Y & 0xFFFF) << 16) | (p.X & 0xFFFF));
+        if (Native.SendMessageTimeout(hwnd, (uint)Native.WM_NCHITTEST, IntPtr.Zero, lp,
+                0x0002 /* SMTO_ABORTIFHUNG */, 20, out ht) == IntPtr.Zero) return -1;
+        return CaptionButtonFromHit(ht.ToInt64());
+    }
+
+    internal static int CaptionButtonFromHit(long ht)
+    {
+        switch (ht)
+        {
+            case 20: return 0;   // HTCLOSE
+            case 9: return 1;    // HTMAXBUTTON
+            case 8: return 2;    // HTMINBUTTON
+            default: return -1;
+        }
     }
 
     static bool IsDescendant(IntPtr h, IntPtr ancestor)
@@ -363,9 +372,23 @@ internal sealed partial class HostForm
         _reTimer.Start();
     }
 
+    // 诊断开关：%LOCALAPPDATA%\AgentHost\no-activate-pair.txt 在，就不发这一对（每次调用都看文件，放上 / 删掉不用重开）。
+    // 2026-10-21 用户说「切换 agent 时这一片区域白一下」：下面为了让 Chromium 吃下 WM_ACTIVATE 临时摘掉它的 WS_CHILD，
+    // 窗口在子窗口 ⇄ 顶层之间翻一下，DWM 可能给它重新合成一帧（没画过的白面，而且浮到动画浮层上面）。先用开关对照。
+    static bool NoActivatePair()
+    {
+        try
+        {
+            string p = System.IO.Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA") ?? "", "AgentHost", "no-activate-pair.txt");
+            return System.IO.File.Exists(p);
+        }
+        catch { return false; }
+    }
+
     void Activate(IntPtr h, bool active)
     {
         if (h == IntPtr.Zero || !Native.IsWindow(h)) return;
+        if (NoActivatePair()) { Log.W("  Activate(" + h.ToInt64().ToString("X") + ", " + (active ? "激活" : "失活") + ") 跳过：no-activate-pair.txt"); return; }
         Log.W("  Activate(" + h.ToInt64().ToString("X") + ", " + (active ? "激活" : "失活") + ")");
         int style = Native.Gwl(h, Native.GWL_STYLE);
         if ((style & Native.WS_CHILD) == 0) return;
