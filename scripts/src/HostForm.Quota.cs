@@ -43,6 +43,10 @@ internal sealed class QuotaAccount
     // 按量付费的（DeepSeek）没有限额，只有余额；-1 = 不是这种
     public double Balance = -1, Granted, ToppedUp;
     public string BalanceCurrency;
+    // Colab 计算单元（挂在 Antigravity 那张卡上，同属 Google AI Pro）；-1 = 没有
+    public double ColabUnits = -1, ColabRate = -1;
+    public long ColabAt;
+    public bool ColabStale;
     public readonly List<QuotaWindow> Windows = new List<QuotaWindow>();
 
     // 顶栏看的那一个：最长的那个主窗口（每周 / 每月）——「快清零」说的是它；某个短窗口用完了另算（Exhausted）
@@ -163,6 +167,11 @@ internal static class Quota
                         {
                             q.Balance = Num(v, "total", -1); q.Granted = Num(v, "granted", 0); q.ToppedUp = Num(v, "toppedUp", 0);
                             q.BalanceCurrency = Str(v, "currency");
+                        }
+                        if (a.TryGetProperty("colab", out v) && v.ValueKind == JsonValueKind.Object)
+                        {
+                            q.ColabUnits = Num(v, "units", -1); q.ColabRate = Num(v, "rate", -1);
+                            q.ColabAt = (long)Num(v, "at", 0); q.ColabStale = Bool(v, "stale");
                         }
                         list.Add(q);
                     }
@@ -360,9 +369,19 @@ internal sealed class QuotaStrip : Control
         return null;
     }
     // 环下面那一行小字。Cursor 的 Auto / 指定模型（Opus 走这份）、Antigravity 的 Claude / Gemini 是 2026-10-27 拆出来的
-    static string Mark(QuotaWindow w)
+    // 用户 11-09「Gemini这种有多个额度的排版能不能专门优化」：组名只留一个词（Claude/GPT → Claude，Gemini 4 Argon → Argon），全名在面板和悬停提示里
+    internal static string ShortGroup(string group)
     {
-        if (!string.IsNullOrEmpty(w.Group)) return w.GroupName;
+        string n = new QuotaWindow { Group = group }.GroupName.Trim();
+        int slash = n.IndexOf('/');
+        if (slash > 0) return n.Substring(0, slash);
+        string[] words = n.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        return words.Length > 1 && words[0] == "Gemini" ? words[words.Length - 1] : n;
+    }
+
+    internal static string Mark(QuotaWindow w)
+    {
+        if (!string.IsNullOrEmpty(w.Group)) return ShortGroup(w.Group);
         switch (w.Label)
         {
             case "5 小时": return "5h";
@@ -374,6 +393,7 @@ internal sealed class QuotaStrip : Control
             default: return L.T("月");
         }
     }
+    public static string Units(double v) { return v.ToString("0.##"); }
     static string Val(QuotaWindow w) { return w.Used >= 98 ? L.T("用完") : (int)Math.Round(w.Left) + "%"; }
 
     // 一家在悬停提示里的一行：「Claude  5 小时剩 84% · 每周剩 4%（周四 08:00 重置）」
@@ -388,6 +408,7 @@ internal sealed class QuotaStrip : Control
             parts.Add(s);
         }
         if (a.Balance >= 0) parts.Add(L.T("余额") + " " + Quota.Money(a.Balance, a.BalanceCurrency));
+        if (a.ColabUnits >= 0) parts.Add(L.F("Colab 剩 {0} 单元", Units(a.ColabUnits)));
         string line = a.Name + "  " + (parts.Count > 0 ? string.Join(" · ", parts)
                     : !string.IsNullOrEmpty(a.Error) ? L.F("这次没读到：{0}", a.Error) : L.T("读不到，点开去官网看"));
         if (a.Hurry) line += L.T("  ← 快清零，赶紧用");
@@ -448,13 +469,32 @@ internal sealed class QuotaStrip : Control
         using (Graphics g = CreateGraphics()) return Math.Max(Ring, (int)Math.Ceiling(g.MeasureString(Mark(w), TagFont).Width));
     }
 
+    // 多额度的那家（两个环以上，或带 Colab）：环挨紧、整组垫一层淡底。
+    //   11-09 出了三种（A 只缩字收紧 / B 再垫淡底 / C 淡底 + Colab 隔开写成数字签），用户选 B
+    static bool Multi(QuotaAccount a) { return Rings(a).Count + (a.ColabUnits >= 0 ? 1 : 0) >= 2; }
+    int Pack { get { return D(6); } }   // 淡底四周留的边
+
+    int ColabSlot(QuotaAccount a)
+    {
+        if (a.ColabUnits < 0) return 0;
+        using (Graphics g = CreateGraphics())
+        {
+            return Math.Max(Ring, (int)Math.Ceiling(g.MeasureString("Colab", TagFont).Width));
+        }
+    }
+    static string ColabText(QuotaAccount a) { return ((int)Math.Floor(a.ColabUnits)).ToString(); }
+
     int Seg(QuotaAccount a, int ringGap)
     {
         List<QuotaWindow> rings = Rings(a);
-        if (rings.Count == 0) return IconPx + D(5) + Ring;
+        bool multi = Multi(a);
+        int gapIn = multi ? Math.Min(ringGap, D(1)) : ringGap;
         int w = IconPx + D(5);
-        foreach (QuotaWindow r in rings) w += Slot(r) + ringGap;
-        return w - ringGap;
+        if (rings.Count == 0 && a.ColabUnits < 0) return w + Ring;
+        foreach (QuotaWindow r in rings) w += Slot(r) + gapIn;
+        if (a.ColabUnits >= 0) w += ColabSlot(a) + gapIn;
+        w -= gapIn;
+        return multi ? w + Pack * 2 : w;
     }
 
     int Total(int gap, int ringGap)
@@ -491,6 +531,17 @@ internal sealed class QuotaStrip : Control
         {
             int w = Seg(a, ringGap);
             if (x + w > Width) break;   // 最挤也放不下的不画半截
+            bool multi = Multi(a);
+            int gapIn = multi ? Math.Min(ringGap, D(1)) : ringGap;
+            int x0 = x;
+            if (multi)
+            {
+                using (GraphicsPath gp = Theme.Round(new RectangleF(x + 0.5f, top - D(3) + 0.5f, w - 1, Ring + TagH + D(5)), D(8)))
+                using (var br = new SolidBrush(Color.FromArgb(Theme.Light ? 10 : 22, Theme.Light ? Color.Black : Color.White)))
+                using (var pen = new Pen(Color.FromArgb(Theme.Light ? 22 : 34, Theme.Light ? Color.Black : Color.White)))
+                { g.FillPath(br, gp); g.DrawPath(pen, gp); }
+                x += Pack;
+            }
             Bitmap icon = IconOf(a, IconPx);
             var ir = new Rectangle(x, top + (Ring - IconPx) / 2, IconPx, IconPx);
             if (icon != null) Theme.Icon(g, icon, ir, 0, D(5));
@@ -506,7 +557,7 @@ internal sealed class QuotaStrip : Control
                 Theme.Text(g, Quota.Money(Math.Round(a.Balance), a.BalanceCurrency), Num, a.Exhausted ? Quota.Spent : Theme.Ink, new RectangleF(rb.X - D(4), rb.Y, rb.Width + D(8), rb.Height), StringAlignment.Center);
                 Theme.Text(g, L.T("余额"), TagFont, Theme.Dim, new RectangleF(cx - D(14), top + Ring, Ring + D(28), TagH), StringAlignment.Center);   // 英文「Balance」比环宽，往两边多借一点
             }
-            else if (rings.Count == 0)
+            else if (rings.Count == 0 && a.ColabUnits < 0)
             {
                 var r0 = new Rectangle(cx, top, Ring, Ring);
                 float sw0 = D(2) + 0.5f;
@@ -518,10 +569,24 @@ internal sealed class QuotaStrip : Control
                 int sl = Slot(wd);
                 PaintRing(g, a, wd, new Rectangle(cx + (sl - Ring) / 2, top, Ring, Ring));
                 Theme.Text(g, Mark(wd), TagFont, Theme.Dim, new RectangleF(cx - D(2), top + Ring, sl + D(4), TagH), StringAlignment.Center);
-                cx += sl + ringGap;
+                cx += sl + gapIn;
             }
-            x += w + gap;
+            if (a.ColabUnits >= 0) PaintColab(g, a, cx, top);
+            x = x0 + w + gap;
         }
+    }
+
+    // Colab：剩多少计算单元。不是百分比，环画满（读不到新数时灰），环里写整数
+    void PaintColab(Graphics g, QuotaAccount a, int cx, int top)
+    {
+        int sl = ColabSlot(a);
+        Color tone = a.ColabUnits < 1 ? Quota.Spent : a.ColabStale ? Theme.Dim : Quota.Good;
+        Color ink = a.ColabUnits < 1 ? Quota.Spent : Theme.Ink;
+        var r = new Rectangle(cx + (sl - Ring) / 2, top, Ring, Ring);
+        float sw = D(2) + 0.5f;
+        Arc(g, new RectangleF(r.X + sw / 2, r.Y + sw / 2, r.Width - sw, r.Height - sw), sw, a.ColabUnits < 1 ? 0 : 100, tone);
+        Theme.Text(g, ColabText(a), Num, ink, new RectangleF(r.X - D(4), r.Y, r.Width + D(8), r.Height), StringAlignment.Center);
+        Theme.Text(g, "Colab", TagFont, Theme.Dim, new RectangleF(cx - D(2), top + Ring, sl + D(4), TagH), StringAlignment.Center);
     }
 
     // 一个环：剩多少画多少，环里写剩几成（用完写 0）
@@ -686,6 +751,7 @@ internal sealed partial class HostForm
                 int rows = 0;
                 foreach (QuotaWindow w in a.Windows) if (w.Used >= 0) rows++;
                 if (a.Balance >= 0) rows++;
+                if (a.ColabUnits >= 0) rows++;
                 bool sub = !string.IsNullOrEmpty(a.Error) || a.Manual && rows == 0 || !string.IsNullOrEmpty(a.Note);
                 int h = D(12) + D(26) + rows * RowH + (sub ? D(22) : 0) + D(10);
                 var r = new Rectangle(Pad, y, W - Pad * 2, h);
@@ -917,6 +983,18 @@ internal sealed partial class HostForm
                 string s = Quota.Money(a.Balance, a.BalanceCurrency);
                 if (a.Granted > 0 || a.ToppedUp > 0) s += "  " + L.F("（赠送 {0} · 充值 {1}）", Quota.Money(a.Granted, a.BalanceCurrency), Quota.Money(a.ToppedUp, a.BalanceCurrency));
                 Theme.Text(g, s, Font, a.Exhausted ? Quota.Spent : Theme.Ink, new RectangleF(tx, y, r.Right - D(12) - tx, RowH), StringAlignment.Near);
+                y += RowH;
+            }
+            if (a.ColabUnits >= 0)
+            {
+                Theme.Text(g, L.T("Colab 计算单元"), Font, Theme.Dim, new RectangleF(lx, y, lw - D(6), RowH), StringAlignment.Near);
+                float sw = D(3);
+                Color ct = a.ColabUnits < 1 ? Quota.Spent : a.ColabStale ? Theme.Dim : Quota.Good;
+                QuotaStrip.Arc(g, new RectangleF(cx + sw / 2, y + (RowH - D(20)) / 2f + sw / 2, D(20) - sw, D(20) - sw), sw, a.ColabUnits < 1 ? 0 : 100, ct);
+                string s = L.F("剩 {0} 单元", QuotaStrip.Units(a.ColabUnits));
+                if (a.ColabRate >= 0) s += " · " + L.F("每小时用 {0}", a.ColabRate.ToString("0.00"));
+                if (a.ColabStale && a.ColabAt > 0) s += " · " + L.F("{0} 读的", Quota.At(a.ColabAt));
+                Theme.Text(g, s, Font, a.ColabUnits < 1 ? Quota.Spent : Theme.Ink, new RectangleF(tx, y, r.Right - D(12) - tx, RowH), StringAlignment.Near);
                 y += RowH;
             }
             string line = !string.IsNullOrEmpty(a.Error)

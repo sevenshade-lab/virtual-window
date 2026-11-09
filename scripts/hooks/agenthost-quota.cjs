@@ -10,6 +10,7 @@
 //   OpenCode Go —— Go 的 key 问 opencode.ai/zen/go/v1/usage（5 小时 / 每周 / 每月）。
 //   Antigravity —— 已打开的官方桌面端 RetrieveUserQuotaSummary（官方分组的周 / 5 小时额度）。
 //   Grok Bot —— 跟 Cursor 同一个账号，问 Cursor 后台的 GetSandUsageStatus（每周）。
+//   Colab   —— WSL 里官方 colab usage 的剩余计算单元，挂在 Antigravity 那张卡上（一小时读一次）。
 //   DeepSeek —— 按量付费，没有限额，读余额：api.deepseek.com/user/balance（key 取 OpenCode 配置里那把，没有再用 DEEPSEEK_API_KEY）。
 // 账户、价钱、续费日都在 %LOCALAPPDATA%\AgentHost\quota-accounts.json，手改；DEFAULTS 里新加的一家会自动补进去，
 // 不想看的那家写 "hidden": true（删掉的话下次又补回来）；宿主面板里每张卡的「隐藏」/ 底下「显示 X」改的就是它。
@@ -339,6 +340,36 @@ async function deepseek() {
   throw new Error('DeepSeek 余额接口回 ' + status);
 }
 
+// ---------- Colab（跟 Antigravity 同属 Google AI Pro） ----------
+// 用户 11-09：「Googlepro订阅里面的colab也可以注明出来」「甚至比订阅本身的模型还重要」。
+// 官方 Colab CLI 装在 WSL Ubuntu 里：colab usage 打出「Current balance: 248.12 compute units」「Usage rate: 0.00/hr」。
+// 一小时最多读一次（缓存在上一份 quota.json 里）；WSL 没在跑就不读（别为一个数把 4GB 的 WSL 拉起来），留旧数。
+const COLAB_EVERY = 3600000;
+function parseColab(text) {
+  const m = /Current balance:\s*([\d.]+)\s*compute units/i.exec(text || '');
+  if (!m) return null;
+  const r = /Usage rate:\s*([\d.]+)\s*\/\s*hr/i.exec(text);
+  const n = /Active assignments:\s*(\d+)/i.exec(text);
+  return { units: parseFloat(m[1]), rate: r ? parseFloat(r[1]) : null, active: n ? parseInt(n[1], 10) : null, at: Date.now() };
+}
+
+function run(exe, args, timeout) {
+  const { execFile } = require('child_process');
+  return new Promise(res => execFile(exe, args, { windowsHide: true, timeout, maxBuffer: 1 << 20, encoding: 'buffer' },
+    (err, out) => res({ err, out: out || Buffer.alloc(0) })));
+}
+
+async function colab(prev) {
+  if (prev && prev.at && Date.now() - prev.at < COLAB_EVERY && !process.argv.includes('--colab')) return prev;
+  // wsl -l 打的是 UTF-16
+  const l = await run('wsl.exe', ['-l', '--running', '-q'], 15000);
+  if (!/Ubuntu-24\.04/.test(l.out.toString('utf16le').replace(/\0/g, ''))) return prev ? Object.assign({}, prev, { stale: true }) : null;
+  const r = await run('wsl.exe', ['-d', 'Ubuntu-24.04', '-u', 'dev', '--', 'bash', '-lc', 'colab usage'], 45000);
+  const got = parseColab(r.out.toString('utf8'));
+  if (got) return got;
+  return prev ? Object.assign({}, prev, { stale: true }) : null;
+}
+
 const READERS = { claude, codex, cursor, 'opencode-go': opencodeGo, antigravity, grokbot, deepseek };
 
 // 订阅还在不在（2026-11-09 用户：「按照额度来判断」「发现订阅没有了就自动去掉显示」「有新的订阅被发现了就自动加上」）。
@@ -373,12 +404,15 @@ async function main() {
   // 藏起来的也照样读：要知道它哪天重新订了，好自动放回来
   const live = accounts.filter(a => a && a.id);
   const raw = {};
+  const ag = prevById.antigravity;
+  const colabP = live.some(a => a.id === 'antigravity') ? colab(ag && ag.colab).catch(() => ag && ag.colab || null) : Promise.resolve(null);
   await Promise.all(live.map(async a => {
     const read = READERS[a.id];
     if (!read) return;
     try { raw[a.id] = await read(); } catch (e) { raw[a.id] = { error: String(e && e.message || e) }; }
   }));
 
+  const colabNow = await colabP;
   let changed = false;
   const out = live.map(a => {
     const base = { id: a.id, icon: a.icon || a.id, name: a.name || a.id, price: a.price ?? null, currency: a.currency || 'USD', url: a.url || '', renewDay: a.renewDay || null, note: a.note || '' };
@@ -392,6 +426,7 @@ async function main() {
       o = Object.assign(base, old && old.windows ? { windows: old.windows, plan: old.plan, at: old.at } : { windows: [] },
         { ok: false, error: r.error });
     }
+    if (a.id === 'antigravity') { const c = colabNow; if (c) o.colab = c; else delete o.colab; }
     const sub = subscribed(a.id, r, raw);
     // 手动藏的：订阅停过一次又续上了 → 自动放回（停过才算，免得刚藏起来的马上又被放回）
     if (a.hidden && sub === false && !a.lapsedSeen) { a.lapsedSeen = true; changed = true; }
@@ -408,4 +443,4 @@ async function main() {
 }
 
 if (require.main === module) main().catch(e => { console.error(e && e.stack || e); process.exit(1); });
-module.exports = { antigravity, antigravityWindows };
+module.exports = { antigravity, antigravityWindows, parseColab };
