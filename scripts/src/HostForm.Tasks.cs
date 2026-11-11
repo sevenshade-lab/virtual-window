@@ -71,10 +71,26 @@ internal static class TaskList
     // 下一张要弹的：还在待批、没弹过的，最早的那张
     public static Rec NextCard()
     {
-        Rec best = null;
+        List<Rec> all = NewCards();
+        return all.Count > 0 ? all[0] : null;
+    }
+
+    // 所有还在待批、没弹过的，早的在前（几张一起来就一起弹，上下排着，各签各的。
+    // 用户 2026-11-11：两张同时等签只看到一张，「应该一上一下同时排列最好」）
+    public static List<Rec> NewCards()
+    {
+        var list = new List<Rec>();
         foreach (Rec r in _live)
-            if (r.State == "pending" && !_carded.Contains(r.Id) && (best == null || r.Updated < best.Updated)) best = r;
-        return best;
+            if (r.State == "pending" && !_carded.Contains(r.Id)) list.Add(r);
+        list.Sort((a, b) => a.Updated.CompareTo(b.Updated));
+        return list;
+    }
+
+    // 这一单现在还在不在待批（委托页里签了、撤销了、超时了，弹着的那张卡就收掉）
+    public static bool IsPending(string id)
+    {
+        foreach (Rec r in _live) if (r.Id == id) return r.State == "pending";
+        return false;
     }
 
     public static int Pending
@@ -313,6 +329,7 @@ internal sealed partial class HostForm
         List<TaskList.Rec> fresh = TaskList.Refresh();
         List<string> events = TaskList.TakeEvents();
         if (_tasksPanel != null && !_tasksPanel.IsDisposed && (fresh.Count > 0 || events.Count > 0)) _tasksPanel.Reload();
+        PruneTaskCards();
         if (fresh.Count == 0 && events.Count > 0)
         {
             ToastAct(events.Count == 1 ? events[0] : L.F("{0} 张委托有新进展 · 设置 → 委托", events.Count), ShowTasks, 10);
@@ -365,23 +382,92 @@ internal sealed partial class HostForm
 
     // ---- 新的待批单子：弹一张小卡，在卡上直接签 ----
     // 不抢焦点（WS_EX_NOACTIVATE）：你正在哪一格里打字，点卡上的按钮也不会把焦点拿走。
-    // 同一张单子只弹一次（TaskList 记着弹过的）；签完一张，还有待批的就换下一张，没有就收起。
+    // 同一张单子只弹一次（TaskList 记着弹过的）。几张待批的一起在：一张单子一张卡，上下排着同时露出来，各签各的，
+    // 签掉 / 关掉一张只收那一张（用户 2026-11-11：两张同时等签只看到一张，「一上一下同时排列最好」「也不会冲突」）。
+    // 以前只有一张卡，第二张来了就把第一张的内容换掉，第一张已记成「弹过」再也不弹 —— 11-11 Cursor 那张就这样没了，
+    // 还可能点在刚换了内容的卡上签错单子。所以卡一旦绑了某张单子就不再换内容。
 
-    TaskCard _taskCard;
+    readonly List<TaskCard> _taskCards = new List<TaskCard>();
+    const int MaxTaskCards = 4;   // 再多就最上面那张写「还有 N 张」，委托页里看全部
+    System.Windows.Forms.Timer _restackTimer;
+
+    internal List<TaskCard> TaskCards { get { _taskCards.RemoveAll(c => c.IsDisposed); return _taskCards; } }
 
     void ShowTaskCard()
     {
-        TaskList.Rec next = TaskList.NextCard();
-        if (next == null) { if (_taskCard != null && !_taskCard.IsDisposed) _taskCard.Close(); return; }
-        if (_taskCard == null || _taskCard.IsDisposed)
+        foreach (TaskCard c in StackTaskCards())
         {
-            _taskCard = new TaskCard(this);
-            _taskCard.FormClosed += delegate { _taskCard = null; };
+            if (!c.Visible) c.Show(this);
+            c.Invalidate();
         }
-        _taskCard.Bind(next);
-        _taskCard.Location = TaskCardSpot(_taskCard.Size);
-        if (!_taskCard.Visible) _taskCard.Show(this);
-        _taskCard.Invalidate();
+    }
+
+    // 给没弹过的待批单子各建一张卡、排好位置（不显示；测试直接调它）
+    internal List<TaskCard> StackTaskCards()
+    {
+        List<TaskCard> cards = TaskCards;
+        bool added = false;
+        foreach (TaskList.Rec r in TaskList.NewCards())
+        {
+            if (cards.Count >= MaxTaskCards) break;
+            var card = new TaskCard(this);
+            card.FormClosed += delegate { _taskCards.Remove(card); RestackTaskCards(); };
+            card.Bind(r);
+            cards.Add(card);
+            added = true;
+        }
+        RestackTaskCards(added);
+        return cards;
+    }
+
+    // 委托页里签了 / 撤销了 / 超时了：那张卡收掉
+    void PruneTaskCards()
+    {
+        bool closed = false;
+        foreach (TaskCard c in TaskCards.ToArray())
+            if (c.Task != null && !TaskList.IsPending(c.Task.Id)) { c.Close(); closed = true; }
+        // 摞满时没露出来的待批单子补上来（宿主没显示时只排不弹：离屏测试）
+        if (closed) { if (Visible) ShowTaskCard(); else StackTaskCards(); }
+    }
+
+    // 早的在上、晚的在下，整摞的底贴在中间那格右下角（TaskCardSpot）。
+    // 收掉一张后要挪别的卡：鼠标正在这摞卡上时先不挪（不然下一张会滑到鼠标底下，连点两下就签了不想签的那张），
+    // 鼠标离开再挪（半秒看一次）。来了新卡要排进来时照挪（force），新来的卡刚露出来那一会儿点不动（TaskCard.Armed）。
+    internal void RestackTaskCards(bool force = false)
+    {
+        List<TaskCard> cards = TaskCards;
+        if (cards.Count == 0) { if (_restackTimer != null) _restackTimer.Stop(); return; }
+        if (!force)
+        {
+            Point m = Cursor.Position;
+            foreach (TaskCard c in cards)
+                if (c.Visible && c.Bounds.Contains(m))
+                {
+                    if (_restackTimer == null)
+                    {
+                        _restackTimer = new System.Windows.Forms.Timer { Interval = 500 };
+                        _restackTimer.Tick += delegate { _restackTimer.Stop(); RestackTaskCards(); };
+                    }
+                    _restackTimer.Stop();
+                    _restackTimer.Start();
+                    return;
+                }
+        }
+        int gap = D(8);
+        int total = 0;
+        foreach (TaskCard c in cards) total += c.Height;
+        total += gap * (cards.Count - 1);
+        int w = cards[0].Width;
+        Point spot = TaskCardSpot(new Size(w, total));
+        int y = spot.Y;
+        int hidden = Math.Max(0, TaskList.Pending - cards.Count);
+        for (int i = 0; i < cards.Count; i++)
+        {
+            cards[i].More = i == 0 ? hidden : 0;
+            var p = new Point(spot.X, y);
+            if (cards[i].Location != p) { cards[i].Location = p; cards[i].Disarm(); }
+            y += cards[i].Height + gap;
+        }
     }
 
     // 小卡贴在中间那格的右下角（用户 2026-10-15 截图定的：「这个位置我觉得最合适」「别的 agent 这个地方也是空的」）。
@@ -443,11 +529,23 @@ internal sealed partial class HostForm
 
         public TaskList.Rec Task { get { return _r; } }
 
+        // 这摞卡没露出来的还有几张（只写在最上面那张的小字里）
+        int _more;
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public int More { get { return _more; } set { if (_more != value) { _more = value; Invalidate(); } } }
+
+        // 刚露出来 / 刚挪过位置的那一会儿按钮点不动：防止本来要点别处，卡正好出现或滑到鼠标底下
+        DateTime _armedAt = DateTime.MinValue;
+        public void Disarm() { _armedAt = DateTime.Now.AddMilliseconds(600); }
+        public bool Armed { get { return DateTime.Now >= _armedAt; } }
+
+        // 一张卡只绑一张单子，绑上就不换（换内容会让人点错单子）
         public void Bind(TaskList.Rec r)
         {
             _r = r;
             _note = null;
             TaskList.MarkCarded(r.Id);
+            Disarm();
             Relayout();
         }
 
@@ -536,12 +634,15 @@ internal sealed partial class HostForm
             {
                 case "close":
                     Close();
+                    host.BeginInvoke((MethodInvoker)host.ShowTaskCard);   // 摞满时没露出来的补上来
                     return;
                 case "all":
-                    Close();
+                    // 委托页里列着全部：弹着的卡一起收掉
+                    foreach (TaskCard c in host.TaskCards.ToArray()) c.Close();
                     host.BeginInvoke((MethodInvoker)host.ShowTasks);
                     return;
             }
+            if (!Armed) return;
             Cursor = Cursors.WaitCursor;
             string err;
             try { err = TaskList.Act(it.What, _r.Id); }
@@ -549,9 +650,9 @@ internal sealed partial class HostForm
             if (err != null) { _note = err; Relayout(); return; }
             host.Toast(it.What == "approve" ? L.F("准许了：{0}", _r.Title) : L.F("没准：{0}", _r.Title));
             TaskList.Refresh();
-            TaskList.Rec next = TaskList.NextCard();
-            if (next == null) Close();
-            else Bind(next);
+            // 只收这一张；别的卡照旧在（还有没弹过的待批单子，排进这摞里）
+            Close();
+            host.BeginInvoke((MethodInvoker)host.ShowTaskCard);
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -578,7 +679,7 @@ internal sealed partial class HostForm
                         g.DrawString(Ask(), bold, ink, ask.R, sf);
                 // 一行小字：谁请的 · 能动什么（· 还有几张等着）
                 string w = _r.Write == "workdir" ? L.T("只写临时目录") : _r.Write == "branch" ? L.T("写分支") : L.T("只读");
-                int others = Math.Max(0, TaskList.Pending - 1);
+                int others = _more;
                 string sub = L.F("{0} 请的", AgentName(_r.From)) + " · " + w + (others > 0 ? L.F(" · 还有 {0} 张", others) : "");
                 Item deny = _items.Find(i => i.What == "deny");
                 int sy = deny != null ? deny.R.Y : Pad + _askH + D(10);
