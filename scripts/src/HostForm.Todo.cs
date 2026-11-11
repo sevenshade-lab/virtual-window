@@ -107,6 +107,25 @@ internal static class TodoList
     }
     public static Color ProjectBack(string kind) { return Color.FromArgb(Theme.Light ? 34 : 52, ProjectInk(kind)); }
 
+    // 图标按接手方画（用户 11-10「改成按接手方」）：DSH 后台任务登的待办 kind=dsh，但点了是切去 GoKind 那家接着做，
+    // 图标、提示里的家名跟着 GoKind 走；kind 只记是在哪家发现的
+    public static string Owner(Item x) { return string.IsNullOrEmpty(x.GoKind) ? x.Kind : x.GoKind; }
+
+    // 项目归主要负责人（用户 11-10）：同一个长期项目的小标统一用一种颜色——
+    // 这个项目里还开着的待办按接手方数，最多的那家；平手或没有开着的就用这条自己的接手方
+    public static string ProjectOwner(Item x)
+    {
+        string own = Owner(x);
+        if (!x.LongTerm) return own;
+        var n = new Dictionary<string, int>();
+        foreach (Item y in Items)
+            if (y.Project == x.Project && (y.State == "open" || y.State == "maybe"))
+            { string o = Owner(y); int c; n.TryGetValue(o, out c); n[o] = c + 1; }
+        string best = own; int bn; n.TryGetValue(own, out bn);
+        foreach (var kv in n) if (kv.Value > bn) { best = kv.Key; bn = kv.Value; }
+        return best;
+    }
+
     public static string GroupName(int g)
     {
         return g == 1 ? L.T("等你的") : g == 2 ? L.T("agent 在做") : g == 3 ? L.T("等别人或外部") : g == 4 ? L.T("长期搁置") : L.T("可能做完了");
@@ -649,7 +668,7 @@ internal sealed partial class HostForm
                     y += lead;
                     lastHead = head ?? lastHead;
                     var r = new Rectangle(Pad, y, W - Pad * 2, h);
-                    AgentKind k = Catalog.ById(x != null ? x.Kind : a.Kind);
+                    AgentKind k = Catalog.ById(x != null ? TodoList.Owner(x) : a.Kind);
                     var c = new Card { R = r, X = x, A = a, Text = text, Icon = k != null ? AgentIcons.Get(k, D(20)) : null, Header = newHead ? head : null };
                     int bodyTop = r.Y + D(10) + D(26) + D(4);
                     c.TextR = new Rectangle(r.X + D(12) + D(30), bodyTop + (body - th) / 2, textW, th);
@@ -901,9 +920,9 @@ internal sealed partial class HostForm
                     int pw = TextRenderer.MeasureText(x.Project, tagF).Width + D(12);
                     var pr = new Rectangle(tx, top + D(3), pw, D(20));
                     using (GraphicsPath gp = Theme.Round(pr, D(6)))
-                    using (var br = new SolidBrush(TodoList.ProjectBack(x.Kind)))
+                    using (var br = new SolidBrush(TodoList.ProjectBack(TodoList.ProjectOwner(x))))
                         g.FillPath(br, gp);
-                    Theme.Text(g, x.Project, tagF, TodoList.ProjectInk(x.Kind), pr, StringAlignment.Center);
+                    Theme.Text(g, x.Project, tagF, TodoList.ProjectInk(TodoList.ProjectOwner(x)), pr, StringAlignment.Center);
                     tx = pr.Right + D(8);
                 }
             }
@@ -1009,7 +1028,7 @@ internal sealed partial class HostForm
     {
         try { Clipboard.SetText(TodoList.ContinueText(x)); } catch { }
         Toast(L.F("已复制「{0}」接着做的那句话，开新对话粘进去", TodoList.ShortTitle(x)));
-        GoToKind(string.IsNullOrEmpty(x.GoKind) ? x.Kind : x.GoKind);
+        GoToKind(TodoList.Owner(x));
     }
 
     // 切到这家的格子（不交焦点）：接着做、把「归档这几个」那句交给 Claude 时用
@@ -1119,7 +1138,7 @@ internal sealed partial class HostForm
                     if (divide) { var dv = new Rectangle(x + D(4), D(7), 1, h - D(14)); if (Dividers.Count == 0) Divider = dv; Dividers.Add(dv); x += lead; }
                     lastQuad = q;
                     int textW = w - (pad + ic + D(6) + tagW + tw + D(8) + D(8) + chk + pad);
-                    AgentKind k = Catalog.ById(it.Kind);
+                    AgentKind k = Catalog.ById(TodoList.Owner(it));
                     var chip = new Chip
                     {
                         R = new Rectangle(x, 0, w, h), X = it, Title = title, Icon = k != null ? AgentIcons.Get(k, ic) : null,
@@ -1143,9 +1162,9 @@ internal sealed partial class HostForm
         string TipOf(Chip c, bool check)
         {
             if (check) return L.T("做完了：从待办里勾掉");
-            AgentKind k = Catalog.ById(c.X.Kind);
+            AgentKind k = Catalog.ById(TodoList.Owner(c.X));
             string who = "【" + (c.X.State == "maybe" ? L.T("可能做完了") : TodoList.QuadName(c.X.Quad)) + "】"
-                + (c.X.LongTerm ? L.T("长期项目") + "「" + c.X.Project + "」· " : "") + (k != null ? k.Name : c.X.Kind) + " · " + TodoList.ShortTitle(c.X)
+                + (c.X.LongTerm ? L.T("长期项目") + "「" + c.X.Project + "」· " : "") + (k != null ? k.Name : TodoList.Owner(c.X)) + " · " + TodoList.ShortTitle(c.X)
                 + (c.X.State == "maybe" ? L.T("（可能做完了）") : c.X.Source == "scan" ? L.T("（推断）") : "")
                 + (c.X.Updated > 0 ? " · " + TodoList.Ago(c.X.Updated) : "");
             return who + "\n" + (c.X.Text ?? "") + "\n\n" + L.T("点一下：复制「接着做」那句话，切到这家的格子");
@@ -1213,9 +1232,9 @@ internal sealed partial class HostForm
                 if (c.TagR.Width > 0 && _tagText.TryGetValue(c, out tag))
                 {
                     using (GraphicsPath gp = Theme.Round(c.TagR, D(6)))
-                    using (var br = new SolidBrush(TodoList.ProjectBack(c.X.Kind)))
+                    using (var br = new SolidBrush(TodoList.ProjectBack(TodoList.ProjectOwner(c.X))))
                         g.FillPath(br, gp);
-                    Theme.Text(g, tag, TagFont, TodoList.ProjectInk(c.X.Kind), c.TagR, StringAlignment.Center);
+                    Theme.Text(g, tag, TagFont, TodoList.ProjectInk(TodoList.ProjectOwner(c.X)), c.TagR, StringAlignment.Center);
                     x = c.TagR.Right + D(6);
                 }
                 int tw = (int)Math.Ceiling(g.MeasureString(c.Title, TitleFont).Width);
