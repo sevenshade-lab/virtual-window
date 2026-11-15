@@ -616,7 +616,8 @@ internal sealed partial class HostForm
             else
             {
                 List<TodoList.Item> all = TodoList.Items;
-                for (int i = 0; i < all.Count; i++)
+                // 这一件排成哪几行：项目里第一件露出来、其余收在「〔项目〕还有 N 件 ›」里
+                void AddItem(int i)
                 {
                     TodoList.Item x0 = all[i];
                     string fk = FoldKeyOf(x0);
@@ -626,6 +627,27 @@ internal sealed partial class HostForm
                     if (!folded || i == first) rows.Add(x0);
                     if (n > 1 && i == lastIx)
                         rows.Add(new[] { fk, folded ? L.F("〔{0}〕还有 {1} 件 ›", x0.Project, n - 1) : L.F("〔{0}〕收起 ‹", x0.Project) });
+                }
+                for (int i = 0; i < all.Count; i++)
+                {
+                    TodoList.Item x0 = all[i];
+                    // 除了「等你的」，别的档默认整档收成一行（「agent 在做 · 12 件 ›」），点了才展开 ——
+                    // 用户 2026-11-15：「目前的待办太多了，根本看不过来」，面板默认只看要他动手 / 拍板的
+                    if (x0.Group != 1)
+                    {
+                        string gk = "G|" + x0.Group;
+                        int gn = 0, gFirst = -1, gLast = -1;
+                        for (int j = 0; j < all.Count; j++) if (all[j].Group == x0.Group) { gn++; if (gFirst < 0) gFirst = j; gLast = j; }
+                        if (!_unfold.Contains(gk))
+                        {
+                            if (i == gFirst) rows.Add(new[] { gk, L.F("{0} · {1} 件 ›", TodoList.GroupName(x0.Group), gn) });
+                            continue;
+                        }
+                        AddItem(i);
+                        if (i == gLast) rows.Add(new[] { gk, L.F("{0} 收起 ‹", TodoList.GroupName(x0.Group)) });
+                        continue;
+                    }
+                    AddItem(i);
                 }
             }
             int count = rows.Count;

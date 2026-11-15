@@ -550,10 +550,12 @@ function projectNames(d) {
   for (const x of d.items) if (x.project) s.add(x.project);
   return [...s];
 }
-// 这个话题够不够算长期项目：已经是项目、或隔天又出现、或单个对话本身聊了好几天（spanDays）
+// 这个话题够不够算项目：已经是项目、或开着的有 2 条以上（用户 2026-11-15「判断为属于一件事的统一变成一个项目」，
+// 面板里一个项目只占一行）、或隔天又出现、或单个对话本身聊了好几天（spanDays）
 function isLongTopic(d, name, spanDays) {
   if (!name || (d.noProject || []).includes(name)) return false;
   if (projectNames(d).includes(name)) return true;
+  if (d.items.filter(x => x.state !== 'done' && x.topic === name).length >= 2) return true;
   const t = (d.topics || {})[name];
   const days = t ? t.days.length : 0, n = t ? t.sessions.length : 0;
   return days >= 3 || (days >= 2 && n >= 3) || (spanDays || 0) >= 3;
@@ -835,7 +837,9 @@ const TOPIC_PROMPT = '你在帮用户整理待办清单。下面是一批待办�
 // 给已有条目补话题（做完的也补，当历史算「隔天又出现」），再按规则给开着的补标项目；回 { topics: {名: [编号…]}, tagged: [{id, project}] }
 async function autoProject(opts) {
   const d0 = load();
-  const all = d0.items;
+  // missing：只补开着、还没话题的（agent 自己 add 的不带话题）—— scan 每轮顺手跑，没有就不问模型
+  const all = opts.missing ? d0.items.filter(x => x.state !== 'done' && !x.topic && !x.project) : d0.items;
+  if (!all.length) return { topics: {}, tagged: [] };
   const known = projectNames(d0).concat(Object.keys(d0.topics || {}));
   const got = {};
   for (let i = 0; i < all.length; i += 15) {
@@ -1029,6 +1033,8 @@ async function scan(opts) {
   });
   // 这轮新登了：整体再看一遍有没有同一件事登了两条（同一轮里两个对话同时登的、之前就有的）
   if (report.added) { try { report.deduped = (await dedupe({})).length; } catch { report.errors++; } }
+  // 没话题的（自己 add 的、新登的）补话题，同一件事开着 2 条以上就归成项目
+  try { report.projected = (await autoProject({ missing: true })).tagged.length; } catch { report.errors++; }
   // 自己登的（add）、刚并进来的还没判过重不重要：补判（只判没判过的，便宜）
   try { report.prio = (await autoPrio({})).length; } catch { report.errors++; }
   // 归档候选 6 小时更新一次（分类按对话最后动静缓存，没新动静的不再问模型）
