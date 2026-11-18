@@ -38,56 +38,74 @@ internal sealed partial class HostForm
     // 每拍卡它几十毫秒，客户端就一顿一顿的（用户 2026-09-26：Codex 切对话卡卡的）。放后台线程截，界面线程只收结果。
     DateTime _blankCheckAt;
     volatile bool _blankBusy;
-    readonly Dictionary<Slot, int> _blankStreak = new Dictionary<Slot, int>();
-    readonly Dictionary<Slot, DateTime> _blankFixedAt = new Dictionary<Slot, DateTime>();
+    sealed class BlankSample
+    {
+        public Slot Slot;
+        public int Generation;
+        public Rectangle Area;
+        public bool Painted;
+    }
+
+    bool CanCheckBlank()
+    {
+        return !_closed && _hostActive && WindowState != FormWindowState.Minimized
+            && (_transition == null || _transition.IsDisposed);
+    }
+
+    bool SampleArea(Slot s, out Rectangle area)
+    {
+        area = Rectangle.Empty;
+        if (!s.Embedded || s.Hwnd == IntPtr.Zero || s.Kind.Cli || s.Custom
+            || s.Site == null || !s.Site.IsHandleCreated || !SlotShowing(s)
+            || s.Site.Width < 200 || s.Site.Height < 200 || !Native.IsWindowVisible(s.Hwnd)
+            || Native.GetAncestor(s.Hwnd, Native.GA_PARENT) != s.Site.Handle) return false;
+        area = s.Site.RectangleToScreen(Rectangle.Inflate(s.Site.ClientRectangle, -12, -12));
+        return true;
+    }
 
     void BlankWatch()
     {
-        if (_closed || _blankBusy || !_hostActive || WindowState == FormWindowState.Minimized) return;
-        if (_transition != null && !_transition.IsDisposed) return;
+        if (_blankBusy || !CanCheckBlank()) return;
         if ((DateTime.Now - _blankCheckAt).TotalMilliseconds < 1950) return;
         _blankCheckAt = DateTime.Now;
-        var todo = new List<KeyValuePair<Slot, Rectangle>>();
+        var todo = new List<BlankSample>();
         foreach (Slot s in _slots)
         {
-            if (!s.Embedded || s.Hwnd == IntPtr.Zero || s.Kind.Cli || s.Custom) continue;
-            // 只看正在显示的那一格：垫在底下的格子 Site 也是可见的，截到的却是盖在上面那家
-            if (s.Site == null || !SlotShowing(s) || s.Site.Width < 200 || s.Site.Height < 200) continue;
-            if (!Native.IsWindowVisible(s.Hwnd)) continue;
-            todo.Add(new KeyValuePair<Slot, Rectangle>(s, s.Site.RectangleToScreen(Rectangle.Inflate(s.Site.ClientRectangle, -12, -12))));
+            if (SampleArea(s, out Rectangle area))
+                todo.Add(new BlankSample { Slot = s, Generation = s.Blank.Generation, Area = area });
         }
         if (todo.Count == 0) return;
         _blankBusy = true;
         System.Threading.ThreadPool.QueueUserWorkItem(delegate
         {
-            var blank = new List<Slot>();
-            var fine = new List<Slot>();
-            try { foreach (var kv in todo) (LayoutTransition.Painted(kv.Value) ? fine : blank).Add(kv.Key); }
-            catch { }
-            try { BeginInvoke((MethodInvoker)delegate { _blankBusy = false; BlankResult(blank, fine); }); }
+            try
+            {
+                foreach (var sample in todo) sample.Painted = LayoutTransition.Painted(sample.Area);
+                BeginInvoke((MethodInvoker)delegate { _blankBusy = false; BlankResult(todo); });
+            }
             catch { _blankBusy = false; }
         });
     }
 
-    void BlankResult(List<Slot> blank, List<Slot> fine)
+    void BlankResult(List<BlankSample> samples)
     {
-        if (_closed) return;
-        foreach (Slot s in fine) _blankStreak[s] = 0;
-        // 截的这一秒里宿主要是开始播动画 / 换了前台，结果作废
-        if (_transition != null && !_transition.IsDisposed) return;
-        foreach (Slot s in blank)
+        foreach (var sample in samples)
         {
-            if (!_slots.Contains(s) || s.Hwnd == IntPtr.Zero || s.Site == null || !SlotShowing(s)) continue;
-            int streak;
-            _blankStreak.TryGetValue(s, out streak);
-            _blankStreak[s] = ++streak;
-            if (streak < 2) continue;
-            DateTime last;
-            if (_blankFixedAt.TryGetValue(s, out last) && (DateTime.Now - last).TotalSeconds < 10) continue;
-            _blankFixedAt[s] = DateTime.Now;
-            _blankStreak[s] = 0;
-            Log.W("blank " + s.Kind.Id + ": 画面空白 " + streak + " 拍，叫醒它重画");
-            Wake(s, "画面空白");
+            if (!CanCheckBlank() || _dragSlot != null || _menuOpen) return;
+            Slot s = sample.Slot;
+            if (!_slots.Contains(s) || !SampleArea(s, out Rectangle area) || sample.Area != area
+                || Waking(s.Hwnd) || !ShouldBeVisible(s.Hwnd)) continue;
+            switch (s.Blank.Observe(sample.Generation, sample.Painted, Environment.TickCount64))
+            {
+                case BlankAction.Rejoin:
+                    bool joined = Embed.Rejoin(s);
+                    Log.W("rejoin " + s.Kind.Id + ": 装回样式后连续两拍空白，自动重新嵌入" + (joined ? "成了" : "没成"));
+                    break;
+                case BlankAction.Wake:
+                    Log.W("blank " + s.Kind.Id + ": 画面连续空白，叫醒它重画");
+                    Wake(s, "画面空白");
+                    break;
+            }
         }
     }
 
@@ -323,6 +341,8 @@ internal sealed partial class HostForm
                 _pulseDirty = true;
                 continue;
             }
+            // 重嵌失败后可能已经还到桌面，冷却期间别让普通的待嵌入路径每拍重排。
+            if (!s.Embedded && s.Blank.DeferDetachedWindow(Environment.TickCount64)) continue;
             // 自己把窗口藏起来（Electron 点 ✕ 多半是收进托盘，窗口还在、只是不可见）。
             // 注意要看**这个窗口自己**的 WS_VISIBLE，不能用 IsWindowVisible ——
             // 放大某一格时别的格子的面板是隐藏的，IsWindowVisible 会连带算成不可见，
@@ -386,13 +406,13 @@ internal sealed partial class HostForm
             // 以前这里一律跳过藏着的，「＋ 新会话」开的终端排在侧栏，就一直「找到窗口，待嵌入」飘在外面。
             if (!s.Site.Visible)
             {
-                if (_queueMode && !Embed.IsChildOf(s.Hwnd, s.Site.Handle) && !Embed.RepairChildStyle(s)) needPlace = true;
+                if (_queueMode && !Embed.IsChildOf(s.Hwnd, s.Site.Handle) && !Embed.RepairChildStyle(s, ShouldBeVisible(s.Hwnd))) needPlace = true;
                 continue;
             }
             if (!Embed.IsChildOf(s.Hwnd, s.Site.Handle))
             {
                 // 多半只是它自己把 WS_CHILD 弄丢了，父窗口没变：轻修，别整页重排
-                if (Embed.RepairChildStyle(s)) Log.W("style " + s.Kind.Id + ": 心跳发现 WS_CHILD 丢了，已装回");
+                if (Embed.RepairChildStyle(s, ShouldBeVisible(s.Hwnd))) Log.W("style " + s.Kind.Id + ": 心跳发现 WS_CHILD 丢了，已装回");
                 else needPlace = true;
             }
             else if (s.Embedded)

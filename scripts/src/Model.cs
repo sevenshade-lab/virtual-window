@@ -66,7 +66,18 @@ internal sealed class WinInfo
 internal sealed class Slot
 {
     public AgentKind Kind;
-    public IntPtr Hwnd;
+    IntPtr _hwnd;
+    public IntPtr Hwnd
+    {
+        get { return _hwnd; }
+        set
+        {
+            if (_hwnd == value) return;
+            _hwnd = value;
+            Blank.WindowChanged();
+        }
+    }
+    public readonly BlankRecovery Blank = new BlankRecovery();
     public Rectangle Pane;
     public Rectangle Content;
     public Panel Site;

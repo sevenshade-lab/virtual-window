@@ -87,6 +87,12 @@ internal static class Native
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern IntPtr SetParent(IntPtr child, IntPtr parent);
+    [DllImport("user32.dll")] public static extern IntPtr GetMenu(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsMenu(IntPtr menu);
+    [DllImport("user32.dll")] public static extern bool SetMenu(IntPtr h, IntPtr menu);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool SetProp(IntPtr h, string key, IntPtr value);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetProp(IntPtr h, string key);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr RemoveProp(IntPtr h, string key);
     [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsChild(IntPtr parent, IntPtr child);
     public const uint GA_PARENT = 1;
@@ -224,6 +230,7 @@ internal static class Native
     public const uint SWP_NOACTIVATE = 0x0010;
     public const uint SWP_FRAMECHANGED = 0x0020;
     public const uint SWP_SHOWWINDOW = 0x0040;
+    public const uint SWP_HIDEWINDOW = 0x0080;
     public static readonly IntPtr HWND_TOP = IntPtr.Zero;
     public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
     public const uint WM_SYSCOMMAND = 0x0112;

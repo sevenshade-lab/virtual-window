@@ -648,6 +648,7 @@ internal sealed partial class HostForm
             {
                 Slot s = _slots[i];
                 if (s.Hwnd == IntPtr.Zero || !Native.IsWindow(s.Hwnd) || s.Site == null) continue;
+                if (!s.Embedded && s.Blank.DeferDetachedWindow(Environment.TickCount64)) continue;
                 // 队列视图里不在中间的格子也得嵌进去（垫在底下或藏着嵌），
                 // 不然它的窗口就一直飘在宿主外面。网格视图的「放大」照旧只嵌看得见的（含垫在底下的）。
                 if (!s.Site.Visible && !_queueMode) continue;

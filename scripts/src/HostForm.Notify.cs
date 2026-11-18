@@ -46,7 +46,7 @@ internal sealed partial class HostForm
             foreach (Slot s in _slots)
             {
                 if (s.Kind.Cli || s.Custom || !s.Embedded) continue;
-                if (Embed.RepairChildStyle(s)) Log.W("style " + s.Kind.Id + ": 它自己把 WS_CHILD 弄丢了，守卫计时器装回（事件没接住）");
+                if (Embed.RepairChildStyle(s, ShouldBeVisible(s.Hwnd))) Log.W("style " + s.Kind.Id + ": 它自己把 WS_CHILD 弄丢了，守卫计时器装回（事件没接住）");
             }
             if (++tick % 25 == 0) SyncLocationHooks();   // 约 1 秒核对一次要听哪些进程
             if (tick % 5 == 0) RepairCursorLevel();
@@ -173,7 +173,7 @@ internal sealed partial class HostForm
                 foreach (Slot ls in _slots)
                     if (ls.Hwnd == hwnd)
                     {
-                        if (Embed.RepairChildStyle(ls)) Log.W("style " + ls.Kind.Id + ": 它自己把 WS_CHILD 弄丢了（切页面），事件一到当场装回");
+                        if (Embed.RepairChildStyle(ls, ShouldBeVisible(ls.Hwnd))) Log.W("style " + ls.Kind.Id + ": 它自己把 WS_CHILD 弄丢了（切页面），事件一到当场装回");
                         break;
                     }
                 return;

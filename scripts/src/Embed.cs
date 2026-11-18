@@ -23,14 +23,15 @@ internal static class Embed
 
     // 直接嵌主窗口，不做「试探 SetParent 再挂回」：Electron 窗口经不起
     // 来回折腾，GetParent 对顶层窗口返回的还是 owner，挂回时会挂错。
-    public static bool Attach(Slot s, IntPtr parent)
+    public static bool Attach(Slot s, IntPtr parent, bool rejoining = false)
     {
         if (s == null || s.Hwnd == IntPtr.Zero || parent == IntPtr.Zero) return false;
         if (!Native.IsWindow(s.Hwnd)) return false;
-        HostWins.Restore(s.Hwnd);
-        if (!s.Embedded)
+        if (!rejoining) HostWins.Restore(s.Hwnd);
+        if (!s.Embedded && !rejoining)
         {
             s.SavedStyle = Native.Gwl(s.Hwnd, Native.GWL_STYLE);
+            NoteSysMenu(s.Hwnd, s.SavedStyle);
             s.SavedEx = Native.Gwl(s.Hwnd, Native.GWL_EXSTYLE);
         }
         // 先换样式再 SetParent，这是文档要求的顺序。
@@ -38,29 +39,14 @@ internal static class Embed
         // WM_GETMINMAXINFO 的 ptMinTrackSize。Electron 会在那里报 minWidth/minHeight，
         // 留着 THICKFRAME 的话，格子比它的最小尺寸小时 MoveWindow 会被悄悄抬回
         // 最小尺寸，内容就会溢出格子被裁掉（Codex/ChatGPT 的最小尺寸比 Claude 大）。
-        int style = Native.Gwl(s.Hwnd, Native.GWL_STYLE);
-        style &= ~Native.WS_POPUP;
-        style &= ~Native.WS_CAPTION;
-        style &= ~Native.WS_THICKFRAME;
-        style &= ~Native.WS_SYSMENU;
-        style &= ~Native.WS_MINIMIZEBOX;
-        style &= ~Native.WS_MAXIMIZEBOX;
-        style &= ~Native.WS_MAXIMIZE;
-        style &= ~Native.WS_MINIMIZE;
-        style |= Native.WS_CHILD | Native.WS_VISIBLE;
-        Native.GwlSet(s.Hwnd, Native.GWL_STYLE, style);
-        int ex = Native.Gwl(s.Hwnd, Native.GWL_EXSTYLE);
-        ex &= ~Native.WS_EX_APPWINDOW;
-        // Claude 桌面端被收起、最小化再还原时会自己带上 WS_EX_LAYERED；分层窗口当子窗口嵌进来就一直空白，
-        // 叫醒也没用（2026-09-28 实测：换版重开后 Claude 格白屏，去掉这一位当场画出来）
-        ex &= ~Native.WS_EX_LAYERED;
-        Native.GwlSet(s.Hwnd, Native.GWL_EXSTYLE, ex);
+        ApplyChildStyle(s, Native.Gwl(s.Hwnd, Native.GWL_STYLE), !rejoining);
         Native.SetParent(s.Hwnd, parent);
-        s.Embedded = IsChildOf(s.Hwnd, parent);
+        s.Embedded = Native.GetAncestor(s.Hwnd, Native.GA_PARENT) == parent
+            && (Native.Gwl(s.Hwnd, Native.GWL_STYLE) & Native.WS_CHILD) != 0;
         if (!s.Embedded)
         {
             // 失败就强制还成正常顶层，不要留一个既不是子窗口又没标题栏的残废。
-            RestoreTopLevel(s.Hwnd);
+            RestoreTopLevel(s.Hwnd, false, !rejoining);
             return false;
         }
         Watch.Note(s.Hwnd);
@@ -68,21 +54,120 @@ internal static class Embed
         return true;
     }
 
+    internal static int ChildStyle(int style, bool visible)
+    {
+        int remove = Native.WS_OVERLAPPEDWINDOW | Native.WS_POPUP | Native.WS_MAXIMIZE | Native.WS_MINIMIZE | Native.WS_VISIBLE;
+        return (style & ~remove) | Native.WS_CHILD | (visible ? Native.WS_VISIBLE : 0);
+    }
+
+    static void ApplyChildStyle(Slot s, int style, bool visible)
+    {
+        // 普通菜单栏有自己的 HMENU。只有窗口还带顶层样式时才能问 GetMenu。
+        if ((style & Native.WS_CHILD) == 0 && s.Kind != null && s.Kind.Id == "codex")
+            RemoveNativeMenu(s.Hwnd);
+        Native.GwlSet(s.Hwnd, Native.GWL_STYLE, ChildStyle(style, visible));
+        int ex = Native.Gwl(s.Hwnd, Native.GWL_EXSTYLE);
+        int want = ex & ~(Native.WS_EX_APPWINDOW | Native.WS_EX_LAYERED);
+        if (want != ex) Native.GwlSet(s.Hwnd, Native.GWL_EXSTYLE, want);
+    }
+
+    // 跟 HWND 一起存，关宿主的兜底路径也能还回。HMENU 归客户端所有。
+    const string MenuProperty = "AgentHost.DetachedMenu";
+    static void RemoveNativeMenu(IntPtr h)
+    {
+        IntPtr menu = Native.GetMenu(h);
+        if (menu == IntPtr.Zero || !Native.IsMenu(menu)) return;
+        if (Native.SetProp(h, MenuProperty, menu) && Native.SetMenu(h, IntPtr.Zero))
+            Log.W("menu codex: 已摘下原生菜单栏");
+        else
+            Log.W("menu codex: 摘下原生菜单栏失败");
+    }
+
+    static void RestoreNativeMenu(IntPtr h)
+    {
+        IntPtr menu = Native.GetProp(h, MenuProperty);
+        if (menu == IntPtr.Zero) return;
+        if (Native.GetMenu(h) != IntPtr.Zero || !Native.IsMenu(menu) || Native.SetMenu(h, menu))
+            Native.RemoveProp(h, MenuProperty);
+        else
+            Log.W("menu codex: 还原原生菜单栏失败");
+    }
+
+    // 有的桌面端（Codex）自己画 – □ ✕、故意不带 WS_SYSMENU；还成顶层时一律补上 WS_OVERLAPPEDWINDOW 就把系统菜单位也带上了，
+    // DWM 跟着在它自己的按钮上再画一套，错开几个像素叠成两层（2026-11-18 实测：去掉这一位当场只剩一层）。
+    // 记在 HWND 的属性上：换宿主、移出再纳入都还在。见过它不带这一位（首次嵌入前、它自己重设样式时）就记下。
+    const string NoSysMenuProperty = "AgentHost.NoSysMenu";
+    static void NoteSysMenu(IntPtr h, int style)
+    {
+        if ((style & Native.WS_SYSMENU) == 0 && Native.GetProp(h, NoSysMenuProperty) == IntPtr.Zero)
+            Native.SetProp(h, NoSysMenuProperty, new IntPtr(1));
+    }
+
+    static int TopLevelStyle(IntPtr h, int style)
+    {
+        style |= Native.WS_OVERLAPPEDWINDOW;
+        if (Native.GetProp(h, NoSysMenuProperty) != IntPtr.Zero) style &= ~Native.WS_SYSMENU;
+        return style;
+    }
+
+    const uint RefreshFrame = Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOZORDER
+        | Native.SWP_NOACTIVATE | Native.SWP_FRAMECHANGED;
+
+    // 只动这一格的父子关系。Drop/UndoDrop 会还原并激活窗口、改队列和提示；
+    // 这里全程保留 HWND 和 Watch 记录，按实际父窗口判断每一步是否成功。
+    public static bool Rejoin(Slot s)
+    {
+        if (!s.Embedded || s.Site == null || !s.Site.IsHandleCreated) return false;
+        IntPtr h = s.Hwnd, parent = s.Site.Handle;
+        if (!Native.IsWindow(h) || Native.GetAncestor(h, Native.GA_PARENT) != parent) return false;
+        IntPtr focus = Native.GetFocus(), foreground = Native.GetForegroundWindow();
+        bool hadFocus = focus == h || Native.IsChild(h, focus);
+        bool joined = ReparentInPlace(s, h, parent);
+        // 短暂隐藏可能让正在打字的输入框失焦。只还给原控件；别处已拿走焦点就让它留在那里。
+        if (hadFocus && Native.GetForegroundWindow() == foreground && s.Embedded
+            && Native.GetAncestor(h, Native.GA_PARENT) == parent && (focus == h || Native.IsChild(h, focus)))
+        {
+            IntPtr current = Native.GetFocus();
+            if (current == IntPtr.Zero || current == parent || current == Native.GetAncestor(parent, Native.GA_ROOT))
+                Native.SetFocus(focus);
+        }
+        return joined;
+    }
+
+    static bool ReparentInPlace(Slot s, IntPtr h, IntPtr parent)
+    {
+        // 保持隐藏直到 Fit 在原格子里 SWP_SHOWWINDOW，免得顶层阶段出现在桌面上。
+        const uint quiet = RefreshFrame & ~Native.SWP_FRAMECHANGED;
+        if (!Native.SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0, quiet | Native.SWP_HIDEWINDOW)) return false;
+        if (Native.SetParent(h, IntPtr.Zero) == IntPtr.Zero)
+        {
+            Native.SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0, quiet | Native.SWP_SHOWWINDOW);
+            return false;
+        }
+        s.Embedded = false;
+        int top = TopLevelStyle(h, Native.Gwl(h, Native.GWL_STYLE) & ~(Native.WS_CHILD | Native.WS_POPUP | Native.WS_VISIBLE));
+        Native.GwlSet(h, Native.GWL_STYLE, top);
+        Native.GwlSet(h, Native.GWL_EXSTYLE, Native.Gwl(h, Native.GWL_EXSTYLE) | Native.WS_EX_APPWINDOW);
+        RestoreNativeMenu(h);
+        Native.SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0, RefreshFrame);
+        return Attach(s, parent, true);
+    }
+
     // 嵌进来的 Electron 自己把 WS_CHILD 弄丢了（Codex 切对话时会重设窗口样式，变回带标题栏的顶层样式 10C70000）：
     // 父窗口还是我们的格子，就当场把 WS_CHILD 装回、去掉它加的框，只刷新边框，不重排。
     // 以前要等心跳（0.7 秒一拍）发现「不是子窗口了」再整页重排 —— 这段时间它按顶层窗口画、带着标题栏闪一下，
     // 整页重排又闪一下；它正忙时来不及改回就停在外面（用户：Codex 莫名其妙弹出来）。返回 true = 修了。
-    public static bool RepairChildStyle(Slot s)
+    public static bool RepairChildStyle(Slot s, bool shouldBeVisible)
     {
         if (s == null || s.Hwnd == IntPtr.Zero || s.Site == null || !s.Embedded) return false;
         int style = Native.Gwl(s.Hwnd, Native.GWL_STYLE);
         if ((style & Native.WS_CHILD) != 0) return false;
         if (!s.Site.IsHandleCreated || Native.GetAncestor(s.Hwnd, Native.GA_PARENT) != s.Site.Handle) return false;
-        int want = (style | Native.WS_CHILD) & ~Native.WS_POPUP & ~Native.WS_CAPTION & ~Native.WS_THICKFRAME
-                   & ~Native.WS_MAXIMIZE & ~Native.WS_MINIMIZE;
-        Native.GwlSet(s.Hwnd, Native.GWL_STYLE, want);
-        Native.SetWindowPos(s.Hwnd, IntPtr.Zero, 0, 0, 0, 0,
-            Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_FRAMECHANGED);
+        NoteSysMenu(s.Hwnd, style);   // 这是它自己刚设的样式，最能说明它要不要系统菜单
+        ApplyChildStyle(s, style, shouldBeVisible || (style & Native.WS_VISIBLE) != 0);
+        Native.SetWindowPos(s.Hwnd, IntPtr.Zero, 0, 0, 0, 0, RefreshFrame);
+        if ((Native.Gwl(s.Hwnd, Native.GWL_STYLE) & Native.WS_CHILD) == 0) return false;
+        s.Blank.StyleRepaired();
         return true;
     }
 
@@ -96,7 +181,8 @@ internal static class Embed
         // 过），Chromium 会按「最大化」算 non-client 内边距，内容四边缩一圈。
         int style = Native.Gwl(s.Hwnd, Native.GWL_STYLE);
         int want = style & ~Native.WS_MAXIMIZE & ~Native.WS_MINIMIZE & ~Native.WS_THICKFRAME & ~Native.WS_CAPTION;
-        if (want != style) Native.GwlSet(s.Hwnd, Native.GWL_STYLE, want);
+        if (want != style) Native.GwlSet(s.Hwnd, Native.GWL_STYLE,
+            s.HiddenSince == DateTime.MinValue ? want | Native.WS_VISIBLE : want);
         // 它自己藏起来了（点了 ✕ 收进托盘）就别顺手显示回来，交给心跳的「待关」流程
         uint show = s.HiddenSince == DateTime.MinValue ? Native.SWP_SHOWWINDOW : 0;
         // 去掉 THICKFRAME 以后，Claude 桌面端仍按「有缩放边框」算非客户区：左右下各留 7px，
@@ -177,7 +263,7 @@ internal static class Embed
     // keepHidden：它自己收进托盘了，还回桌面但保持隐藏。以前一律显示出来，
     // 点 ✕ 之后 Codex 反倒变成一个独立浮窗；「待关」再一看桌面上有它的窗口，就不收了 ——
     // 用户看到的就是「点 ✕ 关不掉」（2026-09-26）。
-    public static void RestoreTopLevel(IntPtr h, bool keepHidden)
+    public static void RestoreTopLevel(IntPtr h, bool keepHidden, bool activate = true)
     {
         if (h == IntPtr.Zero || !Native.IsWindow(h)) return;
         bool stillChild = !IsTopLevel(h);
@@ -191,7 +277,7 @@ internal static class Embed
         stillChild = stillChild || (style & Native.WS_CHILD) != 0;
         style &= ~Native.WS_CHILD;
         style &= ~Native.WS_POPUP;
-        style |= Native.WS_OVERLAPPEDWINDOW;
+        style = TopLevelStyle(h, style);
         if (!keepHidden) style |= Native.WS_VISIBLE;
         Native.GwlSet(h, Native.GWL_STYLE, style);
         int ex = Native.Gwl(h, Native.GWL_EXSTYLE);
@@ -200,9 +286,10 @@ internal static class Embed
         // 已经是顶层就不要再 SetParent(0)：那会把 Electron 的 owner 清掉。
         // 还挂在格子里才摘下来。
         if (stillChild) Native.SetParent(h, IntPtr.Zero);
+        if (IsTopLevel(h)) RestoreNativeMenu(h);
         Native.SetWindowPos(h, Native.HWND_TOP, 120, 80, 1280, 800,
-            Native.SWP_FRAMECHANGED | Native.SWP_NOZORDER | (keepHidden ? Native.SWP_NOACTIVATE : Native.SWP_SHOWWINDOW));
-        if (!keepHidden) Native.ShowWindow(h, Native.SW_RESTORE);
+            Native.SWP_FRAMECHANGED | Native.SWP_NOZORDER | (activate ? 0 : Native.SWP_NOACTIVATE) | (keepHidden ? Native.SWP_NOACTIVATE : Native.SWP_SHOWWINDOW));
+        if (!keepHidden && activate) Native.ShowWindow(h, Native.SW_RESTORE);
         if (IsTopLevel(h)) Watch.Forget(h);
     }
 
